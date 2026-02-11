@@ -49,6 +49,7 @@ class Task(db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = db.Column(db.String(36), db.ForeignKey("session.id"), nullable=False, index=True)
+    category = db.Column(db.String(32), nullable=True, index=True)  # image|website|research|story|android_app|python_app
 
     description = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(32), nullable=False, default="queued")  # queued|running|completed|failed|stopped
@@ -63,9 +64,20 @@ class Task(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
     def to_dict(self) -> dict:
+        category = self.category
+        if self.context_snapshot:
+            try:
+                snap = json.loads(self.context_snapshot)
+                if not category and isinstance(snap, dict) and snap.get("category"):
+                    category = str(snap.get("category")).strip().lower()
+            except Exception:
+                pass
+        if not category and (self.status_detail or "").strip().lower() == "story_generated":
+            category = "story"
         return {
             "id": self.id,
             "session_id": self.session_id,
+            "category": category,
             "description": self.description,
             "status": self.status,
             "status_detail": self.status_detail,

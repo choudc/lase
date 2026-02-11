@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 
 import yaml
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from .config import load_settings, get_default_config, load_config_safely, save_config_safely
 from .db import db
@@ -12,7 +12,7 @@ from .models.session import ApiUsage, LogEntry, Session, Task
 from .core.orchestrator import AgentOrchestrator
 from .core.code_quality_auditor import CodeQualityAuditor
 from .core.predictive_analyzer import PredictiveAnalyzer
-from .core.natural_language_interface import classify_intent
+from .core.natural_language_interface import classify_intent, infer_category
 from .core.toolbus import ToolBus
 from .core import security
 import shutil
@@ -43,6 +43,14 @@ def create_app() -> Flask:
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        # Lightweight schema migration for existing SQLite DBs.
+        try:
+            cols = [r[1] for r in db.session.execute(text("PRAGMA table_info(task)")).fetchall()]
+            if "category" not in cols:
+                db.session.execute(text("ALTER TABLE task ADD COLUMN category VARCHAR(32)"))
+                db.session.commit()
+        except Exception:
+            db.session.rollback()
 
         # Ensure models.yaml exists (matches legacy docs/deploy behavior).
         if not os.path.exists(settings.models_config_path):
@@ -141,6 +149,25 @@ def create_app() -> Flask:
         payload = request.get_json(force=True, silent=True) or {}
         session_id = payload.get("session_id")
         description = (payload.get("description") or "").strip()
+        category = (payload.get("category") or "").strip().lower()
+        inferred_category = infer_category(description)
+        if inferred_category:
+            category = inferred_category
+        if category and category not in {"image", "website", "research", "story", "android_app", "python_app"}:
+            return jsonify({"error": "invalid_category"}), 400
+        story_options = payload.get("story_options") or {}
+        if story_options and not isinstance(story_options, dict):
+            return jsonify({"error": "invalid_story_options"}), 400
+        generate_illustrations = bool(story_options.get("generate_illustrations", True))
+        illustration_count_mode = str(story_options.get("illustration_count_mode", "auto") or "auto").strip().lower()
+        if illustration_count_mode not in {"auto", "manual"}:
+            illustration_count_mode = "auto"
+        illustration_count = int(story_options.get("illustration_count", 10) or 10)
+        illustration_count = max(0, min(10, illustration_count))
+        illustration_style = str(story_options.get("illustration_style", "ghibli") or "ghibli").strip().lower()
+        allowed_styles = {"ghibli", "storybook", "anime", "cinematic", "fantasy", "watercolor", "photorealistic"}
+        if illustration_style not in allowed_styles:
+            illustration_style = "ghibli"
         auto_start = bool(payload.get("auto_start", False))
 
         if not session_id or not Session.query.get(session_id):
@@ -148,7 +175,23 @@ def create_app() -> Flask:
         if not description:
             return jsonify({"error": "missing_description"}), 400
 
-        t = Task(session_id=session_id, description=description, status="queued", progress=0.0, last_output=None)
+        initial_snapshot = {"category": category} if category else {}
+        if category == "story":
+            initial_snapshot["story_options"] = {
+                "generate_illustrations": generate_illustrations,
+                "illustration_count_mode": illustration_count_mode,
+                "illustration_count": illustration_count,
+                "illustration_style": illustration_style,
+            }
+        t = Task(
+            session_id=session_id,
+            category=category or None,
+            description=description,
+            status="queued",
+            progress=0.0,
+            last_output=None,
+            context_snapshot=json.dumps(initial_snapshot) if initial_snapshot else None,
+        )
         db.session.add(t)
         db.session.commit()
 
@@ -310,11 +353,13 @@ def create_app() -> Flask:
         )
         new_task = Task(
             session_id=task.session_id,
+            category=task.category,
             description=description,
             status="queued",
             progress=0.0,
             status_detail="refinement_requested",
             last_output=None,
+            context_snapshot=task.context_snapshot if task.context_snapshot else None,
         )
         db.session.add(new_task)
         db.session.commit()
@@ -842,6 +887,23 @@ def create_app() -> Flask:
         if not os.path.isfile(full):
             return jsonify({"error": "not_found"}), 404
         return send_from_directory(settings.generated_images_dir, safe_name)
+
+    @app.get("/api/story/<task_id>")
+    def serve_story(task_id: str):
+        task = Task.query.get(task_id)
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+        try:
+            snap = json.loads(task.context_snapshot) if task.context_snapshot else {}
+        except Exception:
+            snap = {}
+        html_path = (snap or {}).get("story_artifact_path")
+        if not html_path or not os.path.isfile(html_path):
+            return jsonify({"error": "story_artifact_not_found"}), 404
+        workspace = task.session.workspace_path or ""
+        if not _is_within_workspace(workspace, html_path):
+            return jsonify({"error": "forbidden"}), 403
+        return send_file(html_path, mimetype="text/html; charset=utf-8")
 
     # Static frontend serving (prod build copied into src/static)
     @app.get("/")

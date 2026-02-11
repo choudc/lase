@@ -64,6 +64,15 @@ VISION_WORDS = {
     "photo analysis",
 }
 
+CATEGORY_HINTS = {
+    "story": {"story", "novel", "narrative", "plot", "character", "fairy tale", "bedtime"},
+    "image": {"image", "illustration", "draw", "art", "picture", "photo", "poster"},
+    "website": {"website", "web app", "landing page", "frontend", "react", "vite", "html", "css"},
+    "android_app": {"android app", "apk", "expo", "kotlin", "jetpack compose", "mobile app"},
+    "python_app": {"python app", "python script", "flask app", "fastapi", "django", "cli tool"},
+    "research": {"research", "analyze", "analysis", "compare", "investigate", "report", "study"},
+}
+
 
 def _norm(text: str) -> str:
     t = (text or "").strip().lower()
@@ -94,3 +103,13 @@ def classify_intent(text: str) -> Intent:
 
     return Intent(task_type="general", confidence=0.4)
 
+
+def infer_category(text: str) -> str | None:
+    t = _norm(text)
+    if not t:
+        return None
+    # Prioritize more specific categories first.
+    for cat in ["story", "android_app", "python_app", "website", "image", "research"]:
+        if any(p in t for p in CATEGORY_HINTS[cat]):
+            return cat
+    return None

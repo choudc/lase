@@ -65,10 +65,10 @@ export function getSessionLogs(sessionId, { limit = 50, signal } = {}) {
   return requestJson(getApiBase(), `/sessions/${sessionId}/logs?limit=${encodeURIComponent(limit)}`, { signal })
 }
 
-export function createTask({ session_id, description, auto_start }, { signal } = {}) {
+export function createTask({ session_id, description, category, story_options, auto_start }, { signal } = {}) {
   return requestJson(getApiBase(), '/tasks', {
     method: 'POST',
-    body: { session_id, description, auto_start },
+    body: { session_id, description, category, story_options, auto_start },
     signal,
   })
 }

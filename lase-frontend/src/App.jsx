@@ -52,10 +52,32 @@ import { TaskOutput } from './components/TaskOutput'
 import { IDEPage } from './components/IDEPage'
 
 function App() {
+  const inferCategoryFromPrompt = (text) => {
+    const t = String(text || '').toLowerCase()
+    if (!t.trim()) return null
+    if (/(story|novel|narrative|fairy tale|bedtime|plot|character)/.test(t)) return 'story'
+    if (/(android app|apk|expo|kotlin|jetpack compose|mobile app)/.test(t)) return 'android_app'
+    if (/(python app|python script|flask app|fastapi|django|cli tool)/.test(t)) return 'python_app'
+    if (/(website|web app|landing page|frontend|react|vite|html|css)/.test(t)) return 'website'
+    if (/(image|illustration|draw|art|picture|photo|poster)/.test(t)) return 'image'
+    if (/(research|analyze|analysis|compare|investigate|report|study)/.test(t)) return 'research'
+    return null
+  }
+  const CATEGORY_OPTIONS = [
+    { id: 'image', label: 'Image' },
+    { id: 'website', label: 'Website' },
+    { id: 'research', label: 'Research' },
+    { id: 'story', label: 'Story' },
+    { id: 'android_app', label: 'Android App' },
+    { id: 'python_app', label: 'Python App' },
+  ]
   const [sessions, setSessions] = useState([])
   const [currentSession, setCurrentSession] = useState(null)
   const [tasks, setTasks] = useState([])
   const [newTaskDescription, setNewTaskDescription] = useState('')
+  const [selectedCategory, setSelectedCategory] = useState('website')
+  const [storyGenerateIllustrations, setStoryGenerateIllustrations] = useState(true)
+  const [storyIllustrationStyle, setStoryIllustrationStyle] = useState('ghibli')
   const [isLoading, setIsLoading] = useState(false)
   const [models, setModels] = useState([])
   const [tools, setTools] = useState([])
@@ -206,6 +228,12 @@ function App() {
       const newTask = await apiCreateTask({
         session_id: currentSession.id,
         description: newTaskDescription,
+        category: selectedCategory,
+        story_options: {
+          generate_illustrations: storyGenerateIllustrations,
+          illustration_count_mode: 'auto',
+          illustration_style: storyIllustrationStyle || 'ghibli',
+        },
         auto_start: true,
       })
       setTasks((prev) => [newTask, ...prev])
@@ -216,6 +244,13 @@ function App() {
       setIsLoading(false)
     }
   }
+
+  useEffect(() => {
+    const inferred = inferCategoryFromPrompt(newTaskDescription)
+    if (inferred && inferred !== selectedCategory) {
+      setSelectedCategory(inferred)
+    }
+  }, [newTaskDescription, selectedCategory])
 
   const deleteSession = async (sessionId) => {
     const ok = window.confirm('Delete this session and all its tasks/logs? This cannot be undone.')
@@ -431,6 +466,12 @@ function App() {
     taskToPreviewUrl(task) || taskPreviewUrlsById[task?.id] || null
 
   const getTaskOutputType = (task) => {
+    const category = String(task?.category || '').toLowerCase()
+    if (category === 'image') return 'image'
+    if (category === 'website') return 'website'
+    if (category === 'story') return 'story'
+    if (category === 'android_app' || category === 'python_app') return 'code'
+
     const text = task?.last_output || ''
     const description = task?.description || ''
     const previewUrl = resolveTaskPreviewUrl(task) || ''
@@ -654,6 +695,49 @@ function App() {
               <div className="h-full min-h-0 flex flex-col bg-white dark:bg-gray-800">
                 {/* Task Input */}
                 <div className="p-4 border-b dark:border-gray-700">
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    {CATEGORY_OPTIONS.map((c) => (
+                      <Button
+                        key={c.id}
+                        size="sm"
+                        variant={selectedCategory === c.id ? 'default' : 'outline'}
+                        className="h-7 text-xs"
+                        onClick={() => setSelectedCategory(c.id)}
+                      >
+                        {c.label}
+                      </Button>
+                    ))}
+                  </div>
+                  {selectedCategory === 'story' && (
+                    <div className="mb-3 flex flex-wrap items-center gap-3 rounded border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={storyGenerateIllustrations}
+                          onChange={(e) => setStoryGenerateIllustrations(e.target.checked)}
+                        />
+                        Generate illustration images
+                      </label>
+                      <span className="text-slate-700">Images: Auto (based on story length)</span>
+                      <label className="flex items-center gap-2">
+                        Style:
+                        <select
+                          value={storyIllustrationStyle}
+                          onChange={(e) => setStoryIllustrationStyle(e.target.value)}
+                          className="rounded border bg-white px-2 py-1"
+                          disabled={!storyGenerateIllustrations}
+                        >
+                          <option value="ghibli">Ghibli (default)</option>
+                          <option value="storybook">Storybook</option>
+                          <option value="anime">Anime</option>
+                          <option value="cinematic">Cinematic</option>
+                          <option value="fantasy">Fantasy</option>
+                          <option value="watercolor">Watercolor</option>
+                          <option value="photorealistic">Photorealistic</option>
+                        </select>
+                      </label>
+                    </div>
+                  )}
                   <div className="flex gap-2">
                     <Textarea
                       placeholder="Instruction (e.g., 'Create a React app called dashboard')"
@@ -690,6 +774,9 @@ function App() {
                                 <div className="flex items-center gap-2">
                                   {getStatusIcon(task.status)}
                                   <span className="font-medium text-sm">Task {task.id.slice(0, 6)}</span>
+                                  {task.category && (
+                                    <Badge variant="outline" className="text-[10px] uppercase">{String(task.category).replaceAll('_', ' ')}</Badge>
+                                  )}
                                 </div>
                                 <Badge variant="secondary" className="text-xs">{task.status}</Badge>
                               </div>
@@ -700,7 +787,7 @@ function App() {
                               {(() => {
                                 const outputType = getTaskOutputType(task)
                                 const taskPreviewUrl = resolveTaskPreviewUrl(task)
-                                const showLivePreview = (outputType === 'image' || outputType === 'website') && !!taskPreviewUrl
+                                const showLivePreview = (outputType === 'image' || outputType === 'website' || outputType === 'story') && !!taskPreviewUrl
                                 const showIDE = outputType === 'code' || outputType === 'website'
                                 if (!showLivePreview && !showIDE) return null
                                 return (

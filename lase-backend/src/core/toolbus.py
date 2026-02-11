@@ -111,6 +111,30 @@ class ToolBus:
         self.generated_images_dir = generated_images_dir
         self.process_manager = ProcessManager()
 
+    def _write_web_scripts(self, project_dir: str) -> tuple[str, str]:
+        start_script = os.path.join(project_dir, "start.sh")
+        deploy_script = os.path.join(project_dir, "deploy.sh")
+        with open(start_script, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "PORT=\"${1:-3000}\"\n"
+                "npm install\n"
+                "npm run dev -- --port \"$PORT\" --host\n"
+            )
+        with open(deploy_script, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "PORT=\"${1:-4173}\"\n"
+                "npm install\n"
+                "npm run build\n"
+                "npm run preview -- --port \"$PORT\" --host\n"
+            )
+        os.chmod(start_script, 0o755)
+        os.chmod(deploy_script, 0o755)
+        return start_script, deploy_script
+
     def shell_run(self, command: str, cwd: str | None = None, timeout_s: int = 30) -> ToolResult:
         t0 = time.time()
         try:
@@ -278,7 +302,15 @@ class ToolBus:
                 
                 # Install dependencies immediately to be helpful
                 self.shell_run("npm install", cwd=target_dir, timeout_s=300)
-                return ToolResult(ok=True, output=f"Initialized Web (React) project in {target_dir}. Dependencies installed.", meta={"path": target_dir})
+                start_script, deploy_script = self._write_web_scripts(target_dir)
+                return ToolResult(
+                    ok=True,
+                    output=(
+                        f"Initialized Web (React) project in {target_dir}. Dependencies installed.\n"
+                        f"Start script: {start_script}\nDeploy script: {deploy_script}"
+                    ),
+                    meta={"path": target_dir, "start_script": start_script, "deploy_script": deploy_script},
+                )
 
             elif project_type == "android":
                 # Expo
@@ -333,28 +365,8 @@ class ToolBus:
             meta = {"pid": proc_id, "port": port}
             if project_type == "web":
                 preview_url = f"http://localhost:{port}"
-                start_script = os.path.join(full_path, "start_preview.sh")
-                deploy_script = os.path.join(full_path, "deploy_preview.sh")
                 try:
-                    with open(start_script, "w", encoding="utf-8") as f:
-                        f.write(
-                            "#!/usr/bin/env bash\n"
-                            "set -euo pipefail\n"
-                            "PORT=\"${1:-3000}\"\n"
-                            "npm install\n"
-                            "npm run dev -- --port \"$PORT\" --host\n"
-                        )
-                    with open(deploy_script, "w", encoding="utf-8") as f:
-                        f.write(
-                            "#!/usr/bin/env bash\n"
-                            "set -euo pipefail\n"
-                            "PORT=\"${1:-4173}\"\n"
-                            "npm install\n"
-                            "npm run build\n"
-                            "npm run preview -- --port \"$PORT\" --host\n"
-                        )
-                    os.chmod(start_script, 0o755)
-                    os.chmod(deploy_script, 0o755)
+                    start_script, deploy_script = self._write_web_scripts(full_path)
                     meta["start_script"] = start_script
                     meta["deploy_script"] = deploy_script
                     output = (
