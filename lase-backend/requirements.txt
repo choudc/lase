@@ -1,0 +1,19 @@
+flask==3.0.3
+flask-cors==4.0.1
+flask-sqlalchemy==3.1.1
+pyyaml==6.0.2
+psutil==6.0.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+duckduckgo_search==5.1.0
+
+# Self-improvement tooling (design-aligned). These are optional at runtime;
+# the auditor will report "not installed" if they aren't available.
+bandit==1.7.9
+flake8==7.1.1
+mypy==1.11.2
+pylint==3.2.6
+safety==3.2.9
+flask-socketio==5.3.6
+gevent==24.2.1
+gevent-websocket==0.10.1

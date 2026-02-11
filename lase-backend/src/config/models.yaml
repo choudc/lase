@@ -1,0 +1,43 @@
+default_models:
+  coding:
+    name: gpt-4o
+    provider: openai
+  general:
+    name: gpt-4o
+    provider: openai
+  image_generation:
+    name: stable-diffusion-xl-base-1.0
+    provider: local_sdxl
+  reasoning:
+    name: gpt-4o
+    provider: openai
+  vision:
+    name: gpt-4o
+    provider: openai
+ollama_settings:
+  base_url: http://localhost:11434
+  timeout: 300
+openai_settings:
+  base_url: https://api.openai.com/v1
+  timeout: 60
+gemini_settings:
+  timeout: 60
+anthropic_settings:
+  timeout: 60
+deepseek_settings:
+  base_url: https://api.deepseek.com
+  timeout: 60
+local_sdxl_settings:
+  api_url: http://localhost:7860/sdapi/v1/
+  default_width: 1024
+  default_height: 1024
+  default_steps: 20
+  default_cfg_scale: 7.0
+  default_sampler: DPM++ 2M Karras
+  timeout: 120
+stability_settings:
+  base_url: https://api.stability.ai
+  default_aspect_ratio: '1:1'
+  default_output_format: png
+  default_style_preset: ''
+  timeout: 120
