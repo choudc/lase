@@ -18,6 +18,11 @@ from .core import security
 import shutil
 import time
 import json
+import base64
+import re
+import tempfile
+import subprocess
+import hashlib
 from datetime import datetime, timezone
 import requests
 
@@ -27,6 +32,8 @@ import requests
 def create_app() -> Flask:
     project_root = str(Path(__file__).resolve().parents[1])  # lase-backend/
     settings = load_settings(project_root)
+    bgm_library_dir = os.getenv("LASE_BGM_LIBRARY_DIR", os.path.join(project_root, "bgm_library"))
+    os.makedirs(bgm_library_dir, exist_ok=True)
 
     os.makedirs(os.path.dirname(settings.database_path), exist_ok=True)
     os.makedirs(settings.workspaces_dir, exist_ok=True)
@@ -74,6 +81,58 @@ def create_app() -> Flask:
             return os.path.commonpath([ws_real, cand_real]) == ws_real
         except Exception:
             return False
+
+    def _infer_story_mood(lines: list[str]) -> str:
+        blob = " ".join([str(x or "") for x in lines]).lower()
+        if any(k in blob for k in ["fear", "dark", "haunted", "mystery", "shadow", "secret", "nightmare"]):
+            return "mystery"
+        if any(k in blob for k in ["battle", "quest", "adventure", "dragon", "hero", "journey", "epic"]):
+            return "adventure"
+        if any(k in blob for k in ["happy", "joy", "love", "friend", "magic", "dream", "peace"]):
+            return "uplifting"
+        return "calm"
+
+    def _collect_bgm_candidates(mood: str) -> list[str]:
+        exts = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+        mood_key = str(mood or "calm").strip().lower() or "calm"
+        candidates: list[str] = []
+        mood_dir = os.path.join(bgm_library_dir, mood_key)
+        if os.path.isdir(mood_dir):
+            for root, _, files in os.walk(mood_dir):
+                for fn in files:
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        candidates.append(os.path.join(root, fn))
+        if candidates:
+            return sorted(candidates)
+
+        for root, _, files in os.walk(bgm_library_dir):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() not in exts:
+                    continue
+                low = fn.lower()
+                if mood_key in low:
+                    candidates.append(os.path.join(root, fn))
+        if candidates:
+            return sorted(candidates)
+
+        # Fallback to any track in library.
+        for root, _, files in os.walk(bgm_library_dir):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in exts:
+                    candidates.append(os.path.join(root, fn))
+        return sorted(candidates)
+
+    def _pick_bgm_track(task_id: str, mood: str) -> str | None:
+        candidates = _collect_bgm_candidates(mood)
+        if not candidates:
+            return None
+        seed = hashlib.sha256(f"{task_id}:{mood}".encode("utf-8")).hexdigest()
+        idx = int(seed[:8], 16) % len(candidates)
+        return candidates[idx]
+
+    def _to_bgm_url(track_path: str) -> str:
+        rel = os.path.relpath(track_path, bgm_library_dir).replace("\\", "/")
+        return f"/api/bgm/{rel}"
 
     @app.get("/api/health")
     def health():
@@ -146,6 +205,23 @@ def create_app() -> Flask:
 
     @app.post("/api/tasks")
     def create_task():
+        def _detect_requested_story_minutes(text: str) -> int | None:
+            t = str(text or "").strip().lower()
+            if not t:
+                return None
+            if "half hour" in t or "half-hour" in t:
+                return 30
+            m_hr = re.search(r"\b(\d{1,2})\s*(?:hours|hour|hrs|hr)\b", t)
+            if m_hr:
+                return max(1, min(120, int(m_hr.group(1)) * 60))
+            m_min = re.search(r"\b(\d{1,3})\s*(?:minutes|minute|mins|min)\b", t)
+            if m_min:
+                return max(1, min(120, int(m_min.group(1))))
+            m_compact = re.search(r"\b(\d{1,3})\s*m\b", t)
+            if m_compact:
+                return max(1, min(120, int(m_compact.group(1))))
+            return None
+
         payload = request.get_json(force=True, silent=True) or {}
         session_id = payload.get("session_id")
         description = (payload.get("description") or "").strip()
@@ -168,6 +244,11 @@ def create_app() -> Flask:
         allowed_styles = {"ghibli", "storybook", "anime", "cinematic", "fantasy", "watercolor", "photorealistic"}
         if illustration_style not in allowed_styles:
             illustration_style = "ghibli"
+        target_minutes = int(story_options.get("duration_minutes", 5) or 5)
+        target_minutes = max(3, min(30, target_minutes))
+        detected_minutes = _detect_requested_story_minutes(description)
+        if detected_minutes is not None:
+            target_minutes = max(3, min(30, detected_minutes))
         auto_start = bool(payload.get("auto_start", False))
 
         if not session_id or not Session.query.get(session_id):
@@ -182,6 +263,7 @@ def create_app() -> Flask:
                 "illustration_count_mode": illustration_count_mode,
                 "illustration_count": illustration_count,
                 "illustration_style": illustration_style,
+                "target_minutes": target_minutes,
             }
         t = Task(
             session_id=session_id,
@@ -502,12 +584,8 @@ def create_app() -> Flask:
 
                 save_config_safely(config_path, current_config)
                 
-                # Force reload in adapter? Adapter reloads on init usually.
-                # Ideally Orchestrator's LLMAdapter should reload.
-                # For now, simplistic approach: adapter reads from file or we re-init.
-                # To be proper: orchestrator.llm.reload_config()
                 if hasattr(orchestrator, "llm"):
-                     orchestrator.llm.config = current_config # weak reload
+                    orchestrator.llm.reload_config()
 
                 return jsonify({"status": "updated"})
             except Exception as e:
@@ -897,6 +975,11 @@ def create_app() -> Flask:
             snap = json.loads(task.context_snapshot) if task.context_snapshot else {}
         except Exception:
             snap = {}
+        slides = (snap or {}).get("story_slides")
+        if isinstance(slides, list) and slides:
+            story_title = str((snap or {}).get("story_title") or "Story").strip() or "Story"
+            html = orchestrator._build_story_html(task.id, story_title, slides)
+            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
         html_path = (snap or {}).get("story_artifact_path")
         if not html_path or not os.path.isfile(html_path):
             return jsonify({"error": "story_artifact_not_found"}), 404
@@ -904,6 +987,798 @@ def create_app() -> Flask:
         if not _is_within_workspace(workspace, html_path):
             return jsonify({"error": "forbidden"}), 403
         return send_file(html_path, mimetype="text/html; charset=utf-8")
+
+    @app.post("/api/story/<task_id>/slides/<int:slide_index>/regenerate-image")
+    def regenerate_story_slide_image(task_id: str, slide_index: int):
+        task = Task.query.get(task_id)
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+        try:
+            snap = json.loads(task.context_snapshot) if task.context_snapshot else {}
+        except Exception:
+            snap = {}
+        if not isinstance(snap, dict):
+            snap = {}
+
+        slides = snap.get("story_slides") or []
+        if not isinstance(slides, list) or not slides:
+            return jsonify({"error": "story_slides_not_found"}), 400
+        if slide_index < 0 or slide_index >= len(slides):
+            return jsonify({"error": "invalid_slide_index"}), 400
+
+        slide = slides[slide_index] if isinstance(slides[slide_index], dict) else {}
+        opts = (snap.get("story_options") or {}) if isinstance(snap.get("story_options"), dict) else {}
+        story_character_bible = str(snap.get("story_character_bible") or "").strip()
+        style_key = str(opts.get("illustration_style") or "ghibli").strip().lower()
+        style_text, style_preset = orchestrator._story_style_prompt_and_preset(style_key)
+        stability = orchestrator.llm.config.get("stability_settings") or {}
+        api_key = (
+            security.get_api_key("stability_api_key")
+            or os.getenv("LASE_STABILITY_API_KEY")
+            or stability.get("api_key")
+        )
+        if not api_key:
+            return jsonify({"error": "stability_api_key_not_configured"}), 400
+
+        raw_prompt = (
+            str(slide.get("image_prompt") or "").strip()
+            or str(slide.get("narration") or "").strip()
+            or str(task.description or "").strip()
+        )
+        style_augmented = orchestrator._build_story_illustration_prompt(
+            raw_prompt,
+            style_key,
+            character_bible=story_character_bible,
+            chapter_idx=slide_index + 1,
+        )
+        refined_prompt, refine_source = orchestrator._refine_image_prompt(style_augmented)
+
+        def _gen(prompt: str):
+            return orchestrator.toolbus.image_generate(
+                prompt,
+                negative_prompt=orchestrator._story_negative_prompt(),
+                aspect_ratio="16:9",
+                style_preset=style_preset or stability.get("default_style_preset", "") or None,
+                output_format=stability.get("default_output_format", "png"),
+                api_key=api_key,
+                base_url=stability.get("base_url", "https://api.stability.ai"),
+                timeout_s=int(stability.get("timeout", 120)),
+            )
+
+        res = _gen(refined_prompt)
+        if not getattr(res, "ok", False):
+            fallback_prompt = (
+                str(slide.get("caption") or "").strip()
+                or str(slide.get("title") or "").strip()
+                or str(slide.get("narration") or "").strip()
+                or raw_prompt
+            )
+            fallback_prompt = (
+                f"{fallback_prompt}, {style_text}, "
+                + (f"character bible: {story_character_bible}, " if story_character_bible else "")
+                + "single coherent scene, natural anatomy, "
+                "no extra limbs/fingers/tails, no text or watermark"
+            )[:2000]
+            res = _gen(fallback_prompt)
+
+        if not getattr(res, "ok", False):
+            return jsonify({"error": "image_regeneration_failed", "detail": str(getattr(res, "output", ""))}), 500
+
+        image_path = (res.meta or {}).get("image_path", "")
+        image_url = orchestrator._to_image_preview_url(image_path)
+        if not image_url:
+            return jsonify({"error": "invalid_generated_image"}), 500
+
+        slide["image_url"] = image_url
+        slides[slide_index] = slide
+        snap["story_slides"] = slides
+        task.context_snapshot = json.dumps(snap)
+        db.session.commit()
+
+        # Best-effort persist artifact file for compatibility.
+        story_title = str(snap.get("story_title") or "Story").strip() or "Story"
+        html_path = str(snap.get("story_artifact_path") or "").strip()
+        if html_path:
+            workspace = task.session.workspace_path or ""
+            if _is_within_workspace(workspace, html_path):
+                try:
+                    html = orchestrator._build_story_html(task.id, story_title, slides)
+                    with open(html_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                except Exception:
+                    pass
+
+        try:
+            orchestrator._log(
+                session_id=task.session_id,
+                task_id=task.id,
+                event_type="story_slide_regenerated",
+                data={
+                    "slide_index": slide_index,
+                    "image_url": image_url,
+                    "prompt": refined_prompt,
+                    "prompt_refinement": refine_source,
+                    "character_bible": story_character_bible,
+                },
+            )
+        except Exception:
+            pass
+
+        return jsonify(
+            {
+                "status": "ok",
+                "slide_index": slide_index,
+                "image_url": image_url,
+                "slide": slide,
+            }
+        )
+
+    @app.post("/api/story/translate")
+    def translate_story_narrations():
+        payload = request.get_json(force=True, silent=True) or {}
+        language = str(payload.get("language") or "").strip() or "en-US"
+        narrations = payload.get("narrations") or []
+        if not isinstance(narrations, list):
+            return jsonify({"error": "invalid_narrations"}), 400
+
+        # Bound payload to keep runtime translation lightweight.
+        source = [str(x or "")[:4000] for x in narrations[:20]]
+        if not source:
+            return jsonify({"language": language, "narrations": []})
+
+        lang_low = language.lower()
+        if lang_low.startswith("en"):
+            return jsonify({"language": language, "narrations": source})
+
+        model_info = orchestrator.llm.get_model_for_task("general")
+        prompt = (
+            "Translate each item in the input JSON array to the requested language.\n"
+            "Rules:\n"
+            "- Preserve array length and order exactly.\n"
+            "- Return STRICT JSON array of strings only.\n"
+            "- Do not include markdown, commentary, or code fences.\n"
+            f"Target language: {language}\n"
+            f"Input: {json.dumps(source, ensure_ascii=False)}"
+        )
+        messages = [
+            {"role": "system", "content": "You are a precise translation engine."},
+            {"role": "user", "content": prompt},
+        ]
+        out = orchestrator.llm.call_model(model_info, messages) or ""
+        raw = str(out).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n", "", raw).rstrip("`").strip()
+
+        translated = None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                translated = [str(x or "") for x in parsed]
+        except Exception:
+            translated = None
+
+        if not translated:
+            translated = source
+        if len(translated) < len(source):
+            translated = translated + source[len(translated):]
+        translated = translated[:len(source)]
+        return jsonify({"language": language, "narrations": translated})
+
+    @app.post("/api/story/tts")
+    def synthesize_story_tts():
+        payload = request.get_json(force=True, silent=True) or {}
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "missing_text"}), 400
+        text = text[:1500]
+        selected_voice_name = str(payload.get("selected_voice_name") or "").strip()
+        selected_voice_lang = str(payload.get("selected_voice_lang") or payload.get("language") or "").strip()
+        speech_rate_raw = payload.get("speech_rate", 1.0)
+        try:
+            speech_rate = max(0.5, min(2.0, float(speech_rate_raw)))
+        except Exception:
+            speech_rate = 1.0
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        ffprobe_bin = shutil.which("ffprobe")
+        if not ffmpeg_bin or not ffprobe_bin:
+            return jsonify({"error": "ffmpeg_not_available"}), 500
+
+        def _pick_flite_voice(voice_name: str, voice_lang: str) -> str:
+            nm = str(voice_name or "").lower()
+            lang = str(voice_lang or "").lower()
+            female_tokens = ["female", "woman", "girl", "zira", "aria", "samantha", "victoria", "siri female"]
+            male_tokens = ["male", "man", "boy", "david", "mark", "guy", "daniel", "siri male", "alex"]
+            if any(t in nm for t in female_tokens):
+                return "slt"
+            if any(t in nm for t in male_tokens):
+                return "kal"
+            if lang.startswith("en-gb"):
+                return "rms"
+            if lang.startswith("en"):
+                return "slt"
+            return "slt"
+
+        flite_voice = _pick_flite_voice(selected_voice_name, selected_voice_lang)
+        with tempfile.TemporaryDirectory(prefix="story_tts_", dir="/tmp") as td:
+            text_file = os.path.join(td, "tts.txt")
+            wav_path = os.path.join(td, "tts.wav")
+            wav2_path = os.path.join(td, "tts_rate.wav")
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(text)
+
+            cp = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"flite=textfile={text_file}:voice={flite_voice}",
+                    "-ar",
+                    "24000",
+                    "-ac",
+                    "1",
+                    wav_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                return jsonify({"error": "tts_generation_failed", "detail": (cp.stderr or "")[-400:]}), 500
+
+            rate_cp = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    wav_path,
+                    "-af",
+                    f"atempo={speech_rate:.3f}",
+                    "-ar",
+                    "24000",
+                    "-ac",
+                    "1",
+                    wav2_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            out_path = wav2_path if rate_cp.returncode == 0 and os.path.isfile(wav2_path) else wav_path
+            if not os.path.isfile(out_path):
+                return jsonify({"error": "tts_output_missing"}), 500
+
+            probe = subprocess.run(
+                [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    out_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            try:
+                duration_s = max(0.1, float((probe.stdout or "0.1").strip()))
+            except Exception:
+                duration_s = 0.1
+
+            with open(out_path, "rb") as f:
+                audio_b64 = base64.b64encode(f.read()).decode("ascii")
+        return jsonify(
+            {
+                "status": "ok",
+                "voice_used": flite_voice,
+                "duration_s": duration_s,
+                "audio_base64": audio_b64,
+                "format": "wav",
+            }
+        )
+
+    @app.get("/api/story/<task_id>/bgm")
+    def get_story_bgm(task_id: str):
+        task = Task.query.get(task_id)
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+        try:
+            snap = json.loads(task.context_snapshot) if task.context_snapshot else {}
+        except Exception:
+            snap = {}
+        slides = (snap or {}).get("story_slides") or []
+        narrations = [
+            str((slides[i].get("narration") if i < len(slides) and isinstance(slides[i], dict) else "") or "")
+            for i in range(len(slides))
+        ]
+        mood = _infer_story_mood(narrations)
+        track_path = _pick_bgm_track(task_id, mood)
+        if not track_path:
+            return jsonify({"status": "fallback", "mood": mood, "source": "synth", "track_url": None})
+        return jsonify(
+            {
+                "status": "ok",
+                "mood": mood,
+                "source": "library",
+                "track_url": _to_bgm_url(track_path),
+                "track_name": os.path.basename(track_path),
+            }
+        )
+
+    @app.post("/api/story/<task_id>/video")
+    def generate_story_video(task_id: str):
+        task = Task.query.get(task_id)
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+
+        try:
+            snap = json.loads(task.context_snapshot) if task.context_snapshot else {}
+        except Exception:
+            snap = {}
+        slides = (snap or {}).get("story_slides") or []
+        if not isinstance(slides, list) or not slides:
+            return jsonify({"error": "story_slides_not_found"}), 400
+
+        payload = request.get_json(force=True, silent=True) or {}
+        narrations_in = payload.get("narrations") or []
+        if narrations_in and not isinstance(narrations_in, list):
+            return jsonify({"error": "invalid_narrations"}), 400
+        selected_voice_name = str(payload.get("selected_voice_name") or "").strip()
+        selected_voice_lang = str(payload.get("selected_voice_lang") or payload.get("language") or "").strip()
+        speech_rate_raw = payload.get("speech_rate", 1.0)
+        try:
+            speech_rate = max(0.5, min(2.0, float(speech_rate_raw)))
+        except Exception:
+            speech_rate = 1.0
+        auto_music = bool(payload.get("auto_music", True))
+        narrations = [
+            str((narrations_in[i] if i < len(narrations_in) else ((slides[i] or {}).get("narration") or "")) or "")[:700]
+            for i in range(len(slides))
+        ]
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        ffprobe_bin = shutil.which("ffprobe")
+        if not ffmpeg_bin or not ffprobe_bin:
+            return jsonify({"error": "ffmpeg_not_available"}), 500
+
+        def _resolve_image_path(image_url: str) -> str | None:
+            u = str(image_url or "").strip()
+            if not u:
+                return None
+            if u.startswith("/api/images/"):
+                base = os.path.basename(u)
+                p = os.path.join(settings.generated_images_dir, base)
+                return p if os.path.isfile(p) else None
+            if os.path.isabs(u) and os.path.isfile(u):
+                if _is_within_workspace(settings.generated_images_dir, u):
+                    return u
+            return None
+
+        def _ffmpeg_escape_text(text: str) -> str:
+            t = str(text or "")
+            t = t.replace("\\", "\\\\")
+            t = t.replace(":", "\\:")
+            t = t.replace("'", "\\'")
+            t = t.replace("%", "\\%")
+            t = t.replace("\n", " ")
+            return t.strip()[:180]
+
+        def _ffmpeg_escape_filter_value(value: str) -> str:
+            v = str(value or "")
+            v = v.replace("\\", "\\\\")
+            v = v.replace(":", "\\:")
+            v = v.replace("'", "\\'")
+            v = v.replace(",", "\\,")
+            return v
+
+        def _pick_flite_voice(voice_name: str, voice_lang: str) -> str:
+            # FFmpeg flite commonly exposes: slt (female), kal (male), awb (male), rms (male).
+            nm = str(voice_name or "").lower()
+            lang = str(voice_lang or "").lower()
+            female_tokens = ["female", "woman", "girl", "zira", "aria", "samantha", "victoria", "siri female"]
+            male_tokens = ["male", "man", "boy", "david", "mark", "guy", "daniel", "siri male", "alex"]
+            if any(t in nm for t in female_tokens):
+                return "slt"
+            if any(t in nm for t in male_tokens):
+                return "kal"
+            if lang.startswith("en-gb"):
+                return "rms"
+            if lang.startswith("en"):
+                return "slt"
+            # Non-English text is still synthesized with available flite voice.
+            return "slt"
+
+        def _infer_story_mood(lines: list[str]) -> str:
+            blob = " ".join(lines).lower()
+            if any(k in blob for k in ["fear", "dark", "haunted", "mystery", "shadow", "secret", "nightmare"]):
+                return "mystery"
+            if any(k in blob for k in ["battle", "quest", "adventure", "dragon", "hero", "journey", "epic"]):
+                return "adventure"
+            if any(k in blob for k in ["happy", "joy", "love", "friend", "magic", "dream", "peace"]):
+                return "uplifting"
+            return "calm"
+
+        def _bgm_expr_for_mood(mood: str) -> str:
+            m = str(mood or "calm").lower()
+            if m == "mystery":
+                return (
+                    "0.11*(0.55+0.45*sin(2*PI*2*t))*sin(2*PI*220*t)+"
+                    "0.07*(0.50+0.50*sin(2*PI*2*t+0.8))*sin(2*PI*261.63*t)+"
+                    "0.05*(0.45+0.55*sin(2*PI*4*t))*sin(2*PI*329.63*t)"
+                )
+            if m == "adventure":
+                return (
+                    "0.12*(0.55+0.45*sin(2*PI*2*t))*sin(2*PI*261.63*t)+"
+                    "0.08*(0.50+0.50*sin(2*PI*2*t+0.6))*sin(2*PI*329.63*t)+"
+                    "0.06*(0.50+0.50*sin(2*PI*4*t))*sin(2*PI*392*t)"
+                )
+            if m == "uplifting":
+                return (
+                    "0.11*(0.55+0.45*sin(2*PI*2*t))*sin(2*PI*293.66*t)+"
+                    "0.08*(0.50+0.50*sin(2*PI*2*t+0.9))*sin(2*PI*369.99*t)+"
+                    "0.05*(0.50+0.50*sin(2*PI*4*t))*sin(2*PI*440*t)"
+                )
+            return (
+                "0.10*(0.55+0.45*sin(2*PI*2*t))*sin(2*PI*220*t)+"
+                "0.07*(0.50+0.50*sin(2*PI*2*t+0.7))*sin(2*PI*277.18*t)+"
+                "0.05*(0.45+0.55*sin(2*PI*4*t))*sin(2*PI*329.63*t)"
+            )
+
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        draw_font = f"fontfile={font_path}:" if os.path.isfile(font_path) else ""
+        story_mood = _infer_story_mood(narrations)
+        transition_s = 2.0
+        flite_voice = _pick_flite_voice(selected_voice_name, selected_voice_lang)
+
+        with tempfile.TemporaryDirectory(prefix="story_video_", dir="/tmp") as td:
+            segment_paths: list[str] = []
+            segment_durations: list[float] = []
+            for i, slide in enumerate(slides):
+                slide_obj = slide if isinstance(slide, dict) else {}
+                text = narrations[i] or f"Chapter {i + 1}"
+                text_file = os.path.join(td, f"text_{i}.txt")
+                subtitle_file = os.path.join(td, f"subtitle_{i}.txt")
+                audio_path = os.path.join(td, f"audio_{i}.wav")
+                seg_path = os.path.join(td, f"seg_{i}.mp4")
+                with open(text_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                with open(subtitle_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+                flite_filter = f"flite=textfile={text_file}:voice={flite_voice}"
+                cp = subprocess.run(
+                    [ffmpeg_bin, "-y", "-f", "lavfi", "-i", flite_filter, "-ar", "24000", "-ac", "1", audio_path],
+                    capture_output=True,
+                    text=True,
+                )
+                if cp.returncode != 0:
+                    return jsonify({"error": "tts_generation_failed", "detail": (cp.stderr or "")[-400:]}), 500
+
+                probe = subprocess.run(
+                    [
+                        ffprobe_bin,
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        audio_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                try:
+                    duration = max(1.0, float((probe.stdout or "1").strip()))
+                except Exception:
+                    duration = 2.0
+                seg_duration = max(1.4, duration + transition_s)
+                fade_out_start = max(0.2, seg_duration - transition_s)
+
+                subtitle_file_escaped = _ffmpeg_escape_filter_value(subtitle_file)
+                vf = (
+                    "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
+                    "drawbox=x=0:y=850:w=1920:h=230:color=black@0.55:t=fill,"
+                    f"drawtext={draw_font}textfile='{subtitle_file_escaped}':fontcolor=white:fontsize=56:x=60:y=940:"
+                    "line_spacing=6:reload=0:"
+                    "fix_bounds=1:"
+                    "text_shaping=1,"
+                    "setsar=1,"
+                    f"fade=t=in:st=0:d={transition_s:.3f},"
+                    f"fade=t=out:st={fade_out_start:.3f}:d={transition_s:.3f}"
+                )
+                af = (
+                    f"atempo={speech_rate:.3f},"
+                    f"afade=t=in:st=0:d={transition_s:.3f},"
+                    f"afade=t=out:st={fade_out_start:.3f}:d={transition_s:.3f}"
+                )
+
+                image_path = _resolve_image_path(slide_obj.get("image_url", ""))
+                if image_path:
+                    cmd = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-loop",
+                        "1",
+                        "-i",
+                        image_path,
+                        "-i",
+                        audio_path,
+                        "-t",
+                        f"{seg_duration:.3f}",
+                        "-vf",
+                        vf,
+                        "-af",
+                        af,
+                        "-r",
+                        "30",
+                        "-c:v",
+                        "libx264",
+                        "-aspect",
+                        "16:9",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        seg_path,
+                    ]
+                else:
+                    fallback_vf = (
+                        "drawbox=x=0:y=850:w=1920:h=230:color=black@0.55:t=fill,"
+                        f"drawtext={draw_font}textfile='{subtitle_file_escaped}':fontcolor=white:fontsize=56:x=60:y=940:"
+                        "line_spacing=6:reload=0:"
+                        "fix_bounds=1:"
+                        "text_shaping=1,"
+                        "setsar=1"
+                    )
+                    cmd = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"color=c=#111111:s=1920x1080:r=30:d={seg_duration:.3f}",
+                        "-i",
+                        audio_path,
+                        "-vf",
+                        f"{fallback_vf},fade=t=in:st=0:d={transition_s:.3f},fade=t=out:st={fade_out_start:.3f}:d={transition_s:.3f}",
+                        "-af",
+                        af,
+                        "-c:v",
+                        "libx264",
+                        "-aspect",
+                        "16:9",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        seg_path,
+                    ]
+
+                seg_cp = subprocess.run(cmd, capture_output=True, text=True)
+                if seg_cp.returncode != 0:
+                    return jsonify({"error": "segment_video_failed", "detail": (seg_cp.stderr or "")[-500:]}), 500
+                segment_paths.append(seg_path)
+                segment_durations.append(float(seg_duration))
+
+            if not segment_paths:
+                return jsonify({"error": "no_segments_generated"}), 500
+
+            os.makedirs(settings.generated_images_dir, exist_ok=True)
+            out_name = f"story_{task_id}_{int(time.time())}.mp4"
+            out_path = os.path.join(settings.generated_images_dir, out_name)
+            if len(segment_paths) == 1:
+                shutil.copy2(segment_paths[0], out_path)
+            else:
+                cmd = [ffmpeg_bin, "-y"]
+                for p in segment_paths:
+                    cmd.extend(["-i", p])
+
+                fc_parts: list[str] = []
+                for i in range(len(segment_paths)):
+                    fc_parts.append(f"[{i}:v]settb=AVTB,format=yuv420p[v{i}]")
+                    fc_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+
+                v_prev = "v0"
+                a_prev = "a_concat"
+                cumulative = max(0.1, float(segment_durations[0]))
+                for i in range(1, len(segment_paths)):
+                    v_out = f"vx{i}"
+                    offset = max(0.0, cumulative - transition_s)
+                    fc_parts.append(
+                        f"[{v_prev}][v{i}]xfade=transition=fade:duration={transition_s:.3f}:offset={offset:.3f}[{v_out}]"
+                    )
+                    v_prev = v_out
+                    cumulative = cumulative + max(0.1, float(segment_durations[i])) - transition_s
+                concat_audio_inputs = "".join([f"[a{i}]" for i in range(len(segment_paths))])
+                fc_parts.append(f"{concat_audio_inputs}concat=n={len(segment_paths)}:v=0:a=1[{a_prev}]")
+
+                cmd.extend(
+                    [
+                        "-filter_complex",
+                        ";".join(fc_parts),
+                        "-map",
+                        f"[{v_prev}]",
+                        "-map",
+                        f"[{a_prev}]",
+                        "-c:v",
+                        "libx264",
+                        "-aspect",
+                        "16:9",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-movflags",
+                        "+faststart",
+                        out_path,
+                    ]
+                )
+                final_cp = subprocess.run(cmd, capture_output=True, text=True)
+                if final_cp.returncode != 0:
+                    return jsonify({"error": "video_transition_merge_failed", "detail": (final_cp.stderr or "")[-700:]}), 500
+
+            bgm_status = "skipped"
+            bgm_source = "none"
+            bgm_track_name = ""
+            if auto_music:
+                probe_total = subprocess.run(
+                    [
+                        ffprobe_bin,
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        out_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                try:
+                    total_duration = max(1.0, float((probe_total.stdout or "1").strip()))
+                except Exception:
+                    total_duration = 1.0
+
+                bgm_path = os.path.join(td, "bgm.wav")
+                mix_path = os.path.join(td, "story_mix.mp4")
+                track_path = _pick_bgm_track(task_id, story_mood)
+                bgm_cp = None
+                if track_path:
+                    bgm_track_name = os.path.basename(track_path)
+                    bgm_source = "library"
+                    bgm_cp = subprocess.run(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-stream_loop",
+                            "-1",
+                            "-i",
+                            track_path,
+                            "-t",
+                            f"{total_duration:.3f}",
+                            "-af",
+                            (
+                                "aresample=24000,pan=mono|c0=0.5*c0+0.5*c1,"
+                                f"afade=t=in:st=0:d={transition_s:.3f},"
+                                f"afade=t=out:st={max(0.2, total_duration - transition_s):.3f}:d={transition_s:.3f},"
+                                "volume=0.85"
+                            ),
+                            "-ar",
+                            "24000",
+                            "-ac",
+                            "1",
+                            bgm_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                if (not bgm_cp) or bgm_cp.returncode != 0:
+                    # Fallback: tonal synth bed.
+                    expr = _bgm_expr_for_mood(story_mood)
+                    bgm_source = "synth"
+                    bgm_track_name = ""
+                    bgm_cp = subprocess.run(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            f"aevalsrc={expr}:s=24000:d={total_duration:.3f}",
+                            "-af",
+                            (
+                                "lowpass=f=2200,highpass=f=60,"
+                                f"afade=t=in:st=0:d={transition_s:.3f},"
+                                f"afade=t=out:st={max(0.2, total_duration - transition_s):.3f}:d={transition_s:.3f},"
+                                "volume=1.1"
+                            ),
+                            bgm_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                if bgm_cp.returncode == 0 and os.path.isfile(bgm_path):
+                    mix_cp = subprocess.run(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-i",
+                            out_path,
+                            "-i",
+                            bgm_path,
+                            "-filter_complex",
+                            "[0:a]volume=0.92[a0];[1:a]volume=0.65[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[a]",
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "[a]",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "20",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-c:a",
+                            "aac",
+                            "-shortest",
+                            mix_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if mix_cp.returncode == 0 and os.path.isfile(mix_path):
+                        os.replace(mix_path, out_path)
+                        bgm_status = "added"
+                    else:
+                        bgm_status = "mix_failed"
+                else:
+                    bgm_status = "generation_failed"
+        return jsonify(
+            {
+                "status": "ok",
+                "download_url": f"/api/videos/{out_name}",
+                "format": "mp4",
+                "mood": story_mood,
+                "background_music": bgm_status,
+                "background_music_source": bgm_source,
+                "background_music_track": bgm_track_name,
+                "transition": "fade",
+                "voice_used": flite_voice,
+            }
+        )
+
+    @app.get("/api/videos/<path:filename>")
+    def serve_generated_video(filename: str):
+        safe_name = os.path.basename(filename)
+        if safe_name != filename:
+            return jsonify({"error": "invalid_filename"}), 400
+        full = os.path.join(settings.generated_images_dir, safe_name)
+        if not os.path.isfile(full):
+            return jsonify({"error": "not_found"}), 404
+        return send_from_directory(settings.generated_images_dir, safe_name)
+
+    @app.get("/api/bgm/<path:filename>")
+    def serve_bgm_track(filename: str):
+        rel = str(filename or "").strip().replace("\\", "/")
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            return jsonify({"error": "invalid_filename"}), 400
+        full = os.path.realpath(os.path.join(bgm_library_dir, rel))
+        bgm_real = os.path.realpath(bgm_library_dir)
+        if os.path.commonpath([bgm_real, full]) != bgm_real:
+            return jsonify({"error": "forbidden"}), 403
+        if not os.path.isfile(full):
+            return jsonify({"error": "not_found"}), 404
+        return send_from_directory(os.path.dirname(full), os.path.basename(full))
 
     # Static frontend serving (prod build copied into src/static)
     @app.get("/")

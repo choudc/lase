@@ -552,6 +552,29 @@ class ToolBus:
             with open(image_path, "wb") as f:
                 f.write(img_bytes)
 
+            # Normalize widescreen outputs to full HD for consistent downstream video assembly.
+            if str(aspect_ratio or "").strip() == "16:9":
+                ffmpeg_bin = shutil.which("ffmpeg")
+                if ffmpeg_bin:
+                    hd_path = os.path.join(self.generated_images_dir, f"generated_{int(time.time())}_1920x1080.{ext}")
+                    cp = subprocess.run(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-i",
+                            image_path,
+                            "-vf",
+                            "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                            "-frames:v",
+                            "1",
+                            hd_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if cp.returncode == 0 and os.path.isfile(hd_path):
+                        image_path = hd_path
+
             return ToolResult(
                 ok=True,
                 output=f"Image generated successfully: {image_path}",

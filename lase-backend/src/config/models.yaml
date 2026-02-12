@@ -9,8 +9,8 @@ default_models:
     name: stable-diffusion-xl-base-1.0
     provider: local_sdxl
   reasoning:
-    name: gpt-4o
     provider: openai
+    name: gpt-4o
   vision:
     name: gpt-4o
     provider: openai

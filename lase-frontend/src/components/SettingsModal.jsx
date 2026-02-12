@@ -63,6 +63,8 @@ export function SettingsModal({ open, onOpenChange }) {
         setSuccess(false);
         try {
             await updateModelConfig(config);
+            // Reload from backend so the UI reflects the effective config in use.
+            await loadConfig();
             setSuccess(true);
             setTimeout(() => setSuccess(false), 2000);
         } catch (err) {

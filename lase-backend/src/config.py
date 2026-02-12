@@ -69,7 +69,7 @@ def get_default_config():
         "stability_settings": {
             "api_key": "YOUR_STABILITY_API_KEY",
             "base_url": "https://api.stability.ai",
-            "default_aspect_ratio": "1:1",
+            "default_aspect_ratio": "16:9",
             "default_style_preset": "",
             "default_output_format": "png",
             "timeout": 120,

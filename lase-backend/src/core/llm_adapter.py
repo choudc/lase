@@ -36,6 +36,14 @@ class LLMAdapter:
         self.models_yaml_path = models_yaml_path
         self.config = self._load_config()
 
+    def reload_config(self) -> dict:
+        """
+        Reload model/provider configuration from disk.
+        Returns the effective config now in use.
+        """
+        self.config = self._load_config()
+        return self.config
+
     def _is_chat_provider(self, provider: str) -> bool:
         return provider in {"ollama", "openai", "gemini", "anthropic", "deepseek"}
 

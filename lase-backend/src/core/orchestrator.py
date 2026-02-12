@@ -69,6 +69,26 @@ class AgentOrchestrator:
             return list(obj)
         return str(obj)
 
+    def _trim_text(self, text: str, max_len: int = 2000) -> str:
+        s = str(text or "").strip()
+        if len(s) <= max_len:
+            return s
+        return s[:max_len] + "... [TRUNCATED]"
+
+    def _latest_user_message(self, messages: list[dict]) -> str:
+        for m in reversed(messages or []):
+            if str(m.get("role") or "") != "user":
+                continue
+            content = m.get("content")
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        parts.append(str(p.get("text") or ""))
+                return "\n".join(parts).strip()
+            return str(content or "").strip()
+        return ""
+
     def _update_task(self, task: Task, *, status: str | None = None, progress: float | None = None, last_output: str | None = None, status_detail: str | None = None, execution_log: list[dict] | None = None, context_snapshot: dict | None = None, failure_reason: str | None = None) -> None:
         if status is not None:
             task.status = status
@@ -120,7 +140,10 @@ class AgentOrchestrator:
                 "content": (
                     "You are an expert prompt engineer for image generation. "
                     "Rewrite the user prompt to be vivid, specific, and visually coherent. "
-                    "Include scene composition, lighting, mood, style hints, and quality cues. "
+                    "Keep the output tightly aligned to the exact scenario/situation in the input. "
+                    "Include subject identity/count, action, environment, camera framing, lighting, mood, style hints, and quality cues. "
+                    "Do not introduce unrelated objects/characters/events. "
+                    "Enforce anatomically correct results (no extra limbs/fingers/tails, natural hands/faces). "
                     "Return only a single prompt string with no markdown."
                 ),
             },
@@ -217,6 +240,7 @@ class AgentOrchestrator:
                     "illustration_count_mode": "auto",
                     "illustration_count": 10,
                     "illustration_style": "ghibli",
+                    "target_minutes": 5,
                 }
             snap = json.loads(task.context_snapshot)
             if not isinstance(snap, dict):
@@ -225,6 +249,7 @@ class AgentOrchestrator:
                     "illustration_count_mode": "auto",
                     "illustration_count": 10,
                     "illustration_style": "ghibli",
+                    "target_minutes": 5,
                 }
             opts = snap.get("story_options") or {}
             if not isinstance(opts, dict):
@@ -235,11 +260,13 @@ class AgentOrchestrator:
             style = str(opts.get("illustration_style", "ghibli") or "ghibli").strip().lower()
             if style not in {"ghibli", "storybook", "anime", "cinematic", "fantasy", "watercolor", "photorealistic"}:
                 style = "ghibli"
+            target_minutes = int(opts.get("target_minutes", 5) or 5)
             return {
                 "generate_illustrations": bool(opts.get("generate_illustrations", True)),
                 "illustration_count_mode": count_mode,
                 "illustration_count": max(0, min(10, int(opts.get("illustration_count", 10) or 10))),
                 "illustration_style": style,
+                "target_minutes": max(3, min(30, target_minutes)),
             }
         except Exception:
             return {
@@ -247,22 +274,14 @@ class AgentOrchestrator:
                 "illustration_count_mode": "auto",
                 "illustration_count": 10,
                 "illustration_style": "ghibli",
+                "target_minutes": 5,
             }
 
     def _auto_story_illustration_count(self, slides: list[dict]) -> int:
         if not slides:
             return 0
-        text = " ".join(
-            str(s.get("narration") or "")
-            for s in slides
-            if isinstance(s, dict)
-        ).strip()
-        words = len(text.split()) if text else 0
-        if words <= 0:
-            return min(len(slides), 3)
-        # Rough target: one illustration per ~90 words, capped by available slides and 10.
-        est = max(1, (words + 89) // 90)
-        return max(1, min(10, len(slides), est))
+        # Ensure each chapter/slide gets at least one illustration target.
+        return len(slides)
 
     def _story_style_prompt_and_preset(self, style: str) -> tuple[str, str | None]:
         s = str(style or "ghibli").strip().lower()
@@ -298,19 +317,97 @@ class AgentOrchestrator:
         }
         return mapping.get(s, mapping["ghibli"])
 
-    def _build_story_illustration_prompt(self, raw_prompt: str, style: str) -> str:
+    def _build_story_illustration_prompt(
+        self,
+        raw_prompt: str,
+        style: str,
+        character_bible: str | None = None,
+        chapter_idx: int | None = None,
+    ) -> str:
         base = (raw_prompt or "").strip()
         style_text, _ = self._story_style_prompt_and_preset(style)
+        chapter_hint = ""
+        if chapter_idx and int(chapter_idx) > 0:
+            chapter_hint = f"chapter {int(chapter_idx)} scene only, "
+        character_block = ""
+        if character_bible:
+            cb = str(character_bible).strip()
+            character_block = (
+                "character bible for continuity (must remain consistent across chapters): "
+                f"{cb}. keep face, hair, body type, age impression, outfit signature, and colors consistent unless explicitly changed by the chapter narration, "
+            )
         constraints = (
-            "single coherent scene, correct human anatomy, natural face and hands, clear subject focus, "
-            "consistent perspective, high detail, no text, no logo, no watermark"
+            f"single coherent {chapter_hint}explicit subject count, "
+            "clear action-state and emotion matching the situation, "
+            "consistent character identity/outfit across chapters, anatomically correct humans/animals, "
+            "natural face and hands, two hands only per person, five fingers per hand, no extra limbs or tails, "
+            "consistent perspective and scale, clear subject focus, high detail, clean edges, "
+            "no text, no logo, no watermark, no unrelated elements"
         )
-        return f"{base}, {style_text}, {constraints}"[:2000]
+        return f"{base}, {style_text}, {character_block}{constraints}"[:2000]
+
+    def _derive_story_character_bible(self, task_description: str, slides: list[dict], model_info) -> str:
+        narrations = [
+            str((s or {}).get("narration") or "").strip()
+            for s in (slides or [])
+            if isinstance(s, dict) and str((s or {}).get("narration") or "").strip()
+        ][:24]
+        if not narrations:
+            return ""
+
+        prompt = (
+            "Extract recurring character continuity notes from the story.\n"
+            "Return STRICT JSON array only. Each item keys:\n"
+            "name, role, visual_traits, outfit_signature, color_palette.\n"
+            "Rules:\n"
+            "- Include only recurring characters (appearing across multiple chapters) when possible.\n"
+            "- Keep each field concise (5-18 words).\n"
+            "- Max 5 characters.\n"
+            "- If no recurring characters are identifiable, return [].\n"
+            f"Story request: {task_description}\n"
+            f"Narration chapters: {json.dumps(narrations, ensure_ascii=False)}"
+        )
+        raw = self.llm.call_model(model_info, [{"role": "user", "content": prompt}]) or ""
+        raw = str(raw).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n", "", raw).rstrip("`").strip()
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = []
+        if not isinstance(data, list):
+            return ""
+
+        lines = []
+        for item in data[:5]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            role = str(item.get("role") or "").strip()
+            traits = str(item.get("visual_traits") or "").strip()
+            outfit = str(item.get("outfit_signature") or "").strip()
+            palette = str(item.get("color_palette") or "").strip()
+            if not (name and (traits or outfit)):
+                continue
+            line = (
+                f"{name}"
+                + (f" ({role})" if role else "")
+                + (f": {traits}" if traits else "")
+                + (f"; outfit {outfit}" if outfit else "")
+                + (f"; colors {palette}" if palette else "")
+            )
+            lines.append(line)
+        if not lines:
+            return ""
+        return " | ".join(lines)[:900]
 
     def _story_negative_prompt(self) -> str:
         return (
-            "low quality, blurry, distorted anatomy, extra fingers, malformed hands, bad face, crossed eyes, "
-            "duplicate person, extra limbs, text, logo, watermark, cropped, out of frame, jpeg artifacts"
+            "low quality, blurry, distorted anatomy, deformed body, malformed hands, bad face, crossed eyes, "
+            "extra fingers, fused fingers, missing fingers, extra arms, extra legs, extra tails, extra heads, "
+            "duplicate person, duplicate limbs, dislocated joints, twisted limbs, text, logo, watermark, "
+            "cropped, out of frame, jpeg artifacts"
         )
 
     def _intent_for_task(self, task: Task) -> Intent:
@@ -375,12 +472,101 @@ class AgentOrchestrator:
         ]
         return any(p in text for p in patterns)
 
-    def _generate_story_slides(self, task: Task, model_info) -> tuple[str, list[dict]]:
+    def _generate_story_slides(self, task: Task, model_info, story_opts: dict | None = None) -> tuple[str, list[dict]]:
+        def _sanitize_slide(item: dict, idx: int, fallback_text: str) -> dict:
+            title = str(item.get("title") or f"Chapter {idx + 1}").strip() or f"Chapter {idx + 1}"
+            caption = str(item.get("caption") or title).strip()
+            narration = str(item.get("narration") or fallback_text).strip() or fallback_text
+            image_prompt = str(item.get("image_prompt") or narration).strip() or narration
+            return {
+                "title": title,
+                "caption": caption,
+                "narration": narration,
+                "image_prompt": image_prompt,
+            }
+
+        def _split_sentences_local(text: str) -> list[str]:
+            t = str(text or "").strip()
+            if not t:
+                return []
+            parts = re.split(r"(?<=[\.\!\?。！？])\s+", t)
+            out = [p.strip() for p in parts if p and p.strip()]
+            return out or [t]
+
+        def _expand_to_target_count(slides_in: list[dict], target_count: int) -> list[dict]:
+            slides_local = [_sanitize_slide(s if isinstance(s, dict) else {}, i, task.description or "Story") for i, s in enumerate(slides_in or [])]
+            if not slides_local:
+                slides_local = [
+                    {
+                        "title": "Chapter 1",
+                        "caption": "Opening",
+                        "narration": (task.description or "A story begins.").strip(),
+                        "image_prompt": (task.description or "A story begins.").strip(),
+                    }
+                ]
+
+            while len(slides_local) < target_count:
+                # Split the longest narration first for natural expansion.
+                best_idx = 0
+                best_len = -1
+                for i, s in enumerate(slides_local):
+                    w = len(str(s.get("narration") or "").split())
+                    if w > best_len:
+                        best_idx = i
+                        best_len = w
+                base = slides_local[best_idx]
+                sents = _split_sentences_local(base.get("narration", ""))
+
+                if len(sents) >= 2:
+                    mid = max(1, len(sents) // 2)
+                    n1 = " ".join(sents[:mid]).strip()
+                    n2 = " ".join(sents[mid:]).strip()
+                else:
+                    words = str(base.get("narration") or "").split()
+                    if len(words) >= 16:
+                        midw = max(6, len(words) // 2)
+                        n1 = " ".join(words[:midw]).strip()
+                        n2 = " ".join(words[midw:]).strip()
+                    else:
+                        n1 = str(base.get("narration") or "").strip()
+                        n2 = f"Continuation: {n1}".strip()
+
+                p1 = str(base.get("image_prompt") or n1).strip()
+                p2 = str(base.get("image_prompt") or n2).strip()
+                left = {
+                    "title": str(base.get("title") or f"Chapter {best_idx + 1}").strip(),
+                    "caption": str(base.get("caption") or "").strip() or "Part 1",
+                    "narration": n1 or str(base.get("narration") or "").strip(),
+                    "image_prompt": p1 or n1,
+                }
+                right = {
+                    "title": f"{str(base.get('title') or f'Chapter {best_idx + 1}').strip()} (Cont.)",
+                    "caption": "Continuation",
+                    "narration": n2 or n1,
+                    "image_prompt": p2 or n2 or n1,
+                }
+                slides_local = slides_local[:best_idx] + [left, right] + slides_local[best_idx + 1 :]
+
+            return slides_local[:target_count]
+
+        opts = story_opts or {}
+        target_minutes = max(3, min(30, int(opts.get("target_minutes", 5) or 5)))
+        target_words = int(target_minutes * 130)
+        # Enforce pacing target: 1 chapter per 20 seconds => 3 chapters per minute.
+        chapter_count = max(3, min(180, int(target_minutes * 3)))
+        words_per_chapter = max(28, int(round(target_words / max(1, chapter_count))))
         prompt = (
             "Write a story based on the user prompt.\n"
             "Return STRICT JSON array only. Each item must include keys: "
             "title, caption, narration, image_prompt.\n"
-            "Create 4 to 8 slides. Keep each narration concise (2-5 sentences).\n"
+            f"Target length: about {target_minutes} minutes total narration at normal speaking pace (~130 words/min).\n"
+            f"Create exactly {chapter_count} chapters/slides (about 20 seconds per chapter).\n"
+            f"Each narration should be around {words_per_chapter} words (about +/-20%).\n"
+            "Keep cumulative narration length near target (+/-15%).\n"
+            "For each chapter, image_prompt must describe one clear scene from that exact chapter.\n"
+            "Include character count, key action, setting, time-of-day/lighting, camera framing.\n"
+            "Do NOT add unrelated characters/objects/events not in that chapter.\n"
+            "Avoid distortion by explicitly preferring natural anatomy and realistic hands/faces.\n"
             f"User prompt: {task.description}"
         )
         raw = self.llm.call_model(model_info, [{"role": "user", "content": prompt}]) or ""
@@ -423,14 +609,88 @@ class AgentOrchestrator:
                     "image_prompt": narration,
                 }
             ]
+
+        # If model under-produces chapters, retry once with strict expansion prompt.
+        if len(slides) < chapter_count:
+            retry_prompt = (
+                "Expand the following story slides.\n"
+                f"Return STRICT JSON array with EXACTLY {chapter_count} items.\n"
+                "Each item keys: title, caption, narration, image_prompt.\n"
+                "Preserve continuity while splitting/expanding chapters.\n"
+                f"Input slides: {json.dumps(slides, ensure_ascii=False)}"
+            )
+            retry_raw = self.llm.call_model(model_info, [{"role": "user", "content": retry_prompt}]) or ""
+            retry_raw = retry_raw.strip()
+            if retry_raw.startswith("```"):
+                retry_raw = re.sub(r"^```[a-zA-Z]*\n", "", retry_raw).rstrip("`").strip()
+            try:
+                retry_data = json.loads(retry_raw)
+                if isinstance(retry_data, list) and retry_data:
+                    slides = retry_data
+            except Exception:
+                pass
+
+        slides = _expand_to_target_count(slides, chapter_count)
         if slides and (not story_title or story_title == "Story"):
             first = str(slides[0].get("title") or "").strip()
             if first:
                 story_title = first
-        return story_title, slides[:10]
+        return story_title, slides[:chapter_count]
 
-    def _build_story_html(self, title: str, slides: list[dict]) -> str:
+    def _build_story_youtube_metadata(self, title: str, slides: list[dict]) -> dict:
+        story_title = str(title or "Story").strip() or "Story"
+        narrations = [
+            str((s or {}).get("narration") or "").strip()
+            for s in (slides or [])
+            if isinstance(s, dict)
+        ]
+        joined = " ".join(narrations).strip()
+        summary = joined[:900].strip()
+        if len(joined) > 900:
+            summary += "..."
+
+        words = re.findall(r"[A-Za-z0-9]+", story_title)
+        derived_tags = [f"#{w[:24]}" for w in words[:4] if len(w) > 2]
+        base_tags = ["#StoryTime", "#AIStory", "#Animation", "#AIGenerated", "#Narration"]
+        hashtags = []
+        for t in base_tags + derived_tags:
+            if t not in hashtags:
+                hashtags.append(t)
+        hashtags = hashtags[:8]
+
+        keyword_base = [
+            "ai story",
+            "animated story",
+            "story narration",
+            "children story",
+            "bedtime story",
+            "storybook video",
+        ]
+        keyword_derived = [w.lower() for w in words if len(w) > 2][:8]
+        keywords = []
+        for k in keyword_base + keyword_derived:
+            if k not in keywords:
+                keywords.append(k)
+
+        yt_title = f"{story_title} | AI Animated Story"
+        yt_description = (
+            f"{story_title}\n\n"
+            f"{summary}\n\n"
+            "Generated with LASE (Local Autonomous Software Engineer).\n"
+            "If you enjoyed this story, like, comment, and subscribe for more.\n\n"
+            f"{' '.join(hashtags)}"
+        ).strip()
+
+        return {
+            "title": yt_title[:100],
+            "description": yt_description[:5000],
+            "hashtags": " ".join(hashtags),
+            "keywords": ", ".join(keywords[:20]),
+        }
+
+    def _build_story_html(self, task_id: str, title: str, slides: list[dict]) -> str:
         payload = json.dumps(slides)
+        youtube_meta_payload = json.dumps(self._build_story_youtube_metadata(title, slides))
         safe_title = (title or "Story Slideshow").replace("<", "").replace(">", "")
         return f"""<!doctype html>
 <html lang="en">
@@ -444,7 +704,7 @@ class AgentOrchestrator:
     .grid {{ display:grid; grid-template-columns:2fr 1fr; gap:14px; }}
     .card {{ background:#1b1b1b; border:1px solid #333; border-radius:12px; overflow:hidden; }}
     .image-wrap {{ position:relative; }}
-    .img {{ width:100%; height:500px; object-fit:cover; background:#000; }}
+    .img {{ width:100%; height:500px; object-fit:cover; background:#000; transition: opacity 1s ease; opacity: 1; }}
     .img-caption-tag {{
       position:absolute; left:12px; top:12px; padding:6px 10px;
       background:rgba(15,23,42,.75); border:1px solid rgba(148,163,184,.5);
@@ -453,8 +713,14 @@ class AgentOrchestrator:
     .img-caption {{
       position:absolute; left:0; right:0; bottom:0; padding:10px 14px;
       background:linear-gradient(transparent, rgba(0,0,0,.78));
-      color:#f8fafc; font-size:28px; line-height:1.45; font-weight:700;
+      color:#f8fafc; font-size:28px; line-height:1.45; font-weight:700; text-align:center;
       text-shadow:0 2px 8px rgba(0,0,0,.55);
+    }}
+    .subtitle-word.active {{
+      background: rgba(59, 130, 246, 0.45);
+      border-radius: 6px;
+      padding: 0 3px;
+      box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.35) inset;
     }}
     .txt {{ padding:16px; }}
     .controls {{ display:flex; gap:8px; padding:12px 16px 16px; flex-wrap:wrap; }}
@@ -479,7 +745,65 @@ class AgentOrchestrator:
       background:#1e3a8a33;
       border-color:#3b82f6;
     }}
+    .meta {{
+      margin-top: 12px;
+      border-top: 1px solid #2a2a2a;
+      padding-top: 12px;
+    }}
+    .meta h4 {{
+      margin: 0 0 8px;
+      font-size: 13px;
+      color: #bfdbfe;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }}
+    .meta-row {{ margin: 0 0 10px; }}
+    .meta-label {{
+      display:block;
+      font-size:11px;
+      color:#93c5fd;
+      margin-bottom:4px;
+      text-transform: uppercase;
+      letter-spacing:.04em;
+    }}
+    .meta-input, .meta-textarea {{
+      width:100%;
+      background:#0f172a;
+      color:#e2e8f0;
+      border:1px solid #334155;
+      border-radius:8px;
+      padding:8px 10px;
+      font-size:12px;
+      font-family: Arial, sans-serif;
+    }}
+    .meta-textarea {{
+      min-height:140px;
+      resize:vertical;
+      line-height:1.45;
+    }}
+    .meta-copy {{
+      margin-top:6px;
+      background:#1d4ed8;
+      font-size:12px;
+      padding:6px 10px;
+    }}
     .small {{ color:#93c5fd; font-size:12px; margin-top:4px; }}
+    .status-wrap {{ display:none; width:100%; max-width:520px; }}
+    .status-text {{ color:#93c5fd; font-size:12px; margin-bottom:4px; }}
+    .progress-outer {{
+      width:100%;
+      height:8px;
+      border-radius:999px;
+      background:#0f172a;
+      border:1px solid #334155;
+      overflow:hidden;
+    }}
+    .progress-inner {{
+      height:100%;
+      width:0%;
+      background:linear-gradient(90deg,#2563eb,#38bdf8);
+      transition:width .25s ease;
+    }}
     @media (max-width: 900px) {{
       .grid {{ grid-template-columns:1fr; }}
       .img {{ height:360px; }}
@@ -488,55 +812,239 @@ class AgentOrchestrator:
     }}
   </style>
 </head>
-<body>
+  <body>
   <div class="wrap">
-    <h1>{safe_title}</h1>
     <div class="grid">
       <div class="card">
         <div class="image-wrap">
           <img id="slideImage" class="img" alt="Illustration" />
-          <div id="slideCaptionTag" class="img-caption-tag"></div>
           <div id="slideCaptionOverlay" class="img-caption"></div>
         </div>
         <div class="txt">
-          <h2 id="slideTitle"></h2>
           <p id="slideNarration"></p>
         </div>
         <div class="controls">
-          <button class="secondary" onclick="prev()">Prev</button>
-          <button onclick="playStory()">Play Story</button>
-          <button onclick="readCurrent()">Read Current</button>
-          <button class="secondary" onclick="pauseStory()">Pause</button>
-          <button class="secondary" onclick="next()">Next</button>
+          <button class="secondary" id="prevBtn" onclick="prev()">Prev</button>
+          <button id="playBtn" onclick="playStory()">Play Story</button>
+          <button id="readBtn" onclick="readCurrent()">Read Current</button>
+          <button class="secondary" id="pauseBtn" onclick="pauseStory()">Pause</button>
+          <button class="secondary" id="nextBtn" onclick="next()">Next</button>
+          <button class="secondary" id="regenBtn" onclick="regenerateCurrentImage()">Regenerate Image</button>
+          <button class="secondary" id="videoBtn" onclick="generateStoryVideo()">Generate Video</button>
+          <select id="chapterSelect" title="Chapter"></select>
           <select id="voiceSelect" title="Narration voice"></select>
+        </div>
+        <div class="controls">
+          <a id="videoDownload" style="display:none; color:#93c5fd;" download="story.mp4">Download Story Video</a>
+          <div id="translationStatusWrap" class="status-wrap">
+            <div id="translationStatus" class="status-text">Translating subtitles...</div>
+            <div class="progress-outer"><div id="translationProgressBar" class="progress-inner"></div></div>
+          </div>
+          <div id="videoStatusWrap" class="status-wrap">
+            <div id="videoStatus" class="status-text">Generating video...</div>
+            <div class="progress-outer"><div id="videoProgressBar" class="progress-inner"></div></div>
+          </div>
+          <span id="regenStatus" style="color:#93c5fd; font-size:12px; display:none;">Regenerating image...</span>
         </div>
       </div>
       <div class="card script">
         <h3>Complete Script</h3>
         <ol id="scriptList"></ol>
+        <div class="meta">
+          <h4>YouTube Metadata</h4>
+          <div class="meta-row">
+            <label class="meta-label" for="ytTitle">Title</label>
+            <input id="ytTitle" class="meta-input" readonly />
+            <button class="meta-copy" onclick="copyText(document.getElementById('ytTitle').value)">Copy Title</button>
+          </div>
+          <div class="meta-row">
+            <label class="meta-label" for="ytDescription">Description</label>
+            <textarea id="ytDescription" class="meta-textarea" readonly></textarea>
+            <button class="meta-copy" onclick="copyText(document.getElementById('ytDescription').value)">Copy Description</button>
+          </div>
+          <div class="meta-row">
+            <label class="meta-label" for="ytHashtags">Hashtags</label>
+            <input id="ytHashtags" class="meta-input" readonly />
+            <button class="meta-copy" onclick="copyText(document.getElementById('ytHashtags').value)">Copy Hashtags</button>
+          </div>
+          <div class="meta-row">
+            <label class="meta-label" for="ytKeywords">Keywords</label>
+            <input id="ytKeywords" class="meta-input" readonly />
+            <button class="meta-copy" onclick="copyText(document.getElementById('ytKeywords').value)">Copy Keywords</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
   <script>
+    const taskId = {json.dumps(task_id)};
     const slides = {payload};
+    const youtubeMeta = {youtube_meta_payload};
     let idx = 0;
     let playing = false;
-    let selectedVoiceName = 'auto';
+    let selectedVoiceName = 'Google UK English Female';
+    let narrationRunId = 0;
+    let translationRunId = 0;
+    const CHAPTER_TRANSITION_MS = 2000;
+    let translationPromise = Promise.resolve();
+    let isTranslating = false;
+    let bgmCtx = null;
+    let bgmMaster = null;
+    let bgmNodes = [];
+    let bgmTrackAudio = null;
+    let bgmScheduler = null;
+    let bgmNextTime = 0;
+    let bgmStep = 0;
+    let activeAudioEl = null;
+    let subtitleTicker = null;
+    let videoProgressTicker = null;
+    let storyPlaybackEndResolver = null;
+    const sourceNarrations = slides.map((s) => String((s && s.narration) || '').trim());
+    const narrationByLang = {{ source: sourceNarrations }};
+    let activeLanguage = 'source';
 
     function getNarration(s) {{
-      return (s.caption || '') + '. ' + (s.narration || '');
+      const i = slides.indexOf(s);
+      if (i < 0) return String((s && s.narration) || '');
+      const arr = narrationByLang[activeLanguage] || sourceNarrations;
+      return String(arr[i] || sourceNarrations[i] || '');
+    }}
+
+    function getCurrentLanguageTag() {{
+      if (activeLanguage && activeLanguage !== 'source') return String(activeLanguage);
+      const v = getPreferredVoice();
+      const lang = String((v && v.lang) || '').trim();
+      return lang || 'en-US';
     }}
 
     function splitSentences(text) {{
       const t = String(text || '').trim();
       if (!t) return [''];
-      const parts = t.match(/[^.!?]+[.!?]*/g) || [t];
+      const lang = getCurrentLanguageTag();
+      if (typeof Intl !== 'undefined' && Intl.Segmenter) {{
+        try {{
+          const seg = new Intl.Segmenter(lang, {{ granularity: 'sentence' }});
+          const rows = Array.from(seg.segment(t)).map((r) => String(r.segment || '').trim()).filter(Boolean);
+          if (rows.length) return rows;
+        }} catch (_) {{}}
+      }}
+      const parts = t.match(/[^.!?。！？！？؛،\\n]+[.!?。！？！？؛،]?/g) || [t];
       return parts.map((p) => p.trim()).filter(Boolean);
+    }}
+
+    function splitWords(sentence) {{
+      const s = String(sentence || '');
+      if (!s) return [];
+      const lang = getCurrentLanguageTag();
+      if (typeof Intl !== 'undefined' && Intl.Segmenter) {{
+        try {{
+          const seg = new Intl.Segmenter(lang, {{ granularity: 'word' }});
+          const out = [];
+          for (const r of seg.segment(s)) {{
+            const token = String(r.segment || '');
+            if (!token) continue;
+            const isWordLike = r.isWordLike === undefined ? !!token.trim() : !!r.isWordLike;
+            if (!isWordLike) continue;
+            out.push({{ text: token, index: Number(r.index || 0) }});
+          }}
+          if (out.length) return out;
+        }} catch (_) {{}}
+      }}
+      const out = [];
+      const re = /\\S+/g;
+      let m;
+      while ((m = re.exec(s)) !== null) {{
+        out.push({{ text: m[0], index: m.index }});
+      }}
+      return out;
+    }}
+
+    function escapeHtml(text) {{
+      return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
+    function setSubtitleSentence(text, sentenceIndex = 0, charIndexInSentence = -1) {{
+      const parts = splitSentences(text);
+      const idxSafe = Math.max(0, Math.min(parts.length - 1, sentenceIndex));
+      const sentence = parts[idxSafe] || String(text || '').trim();
+      const el = document.getElementById('slideCaptionOverlay');
+      if (!el) return;
+
+      const words = splitWords(sentence);
+      if (!words.length || charIndexInSentence < 0) {{
+        el.textContent = sentence;
+        return;
+      }}
+
+      let activeIdx = 0;
+      for (let i = 0; i < words.length; i += 1) {{
+        const start = Number(words[i].index || 0);
+        const nextStart = i + 1 < words.length ? Number(words[i + 1].index || sentence.length) : sentence.length + 1;
+        if (charIndexInSentence >= start && charIndexInSentence < nextStart) {{
+          activeIdx = i;
+          break;
+        }}
+      }}
+
+      let html = '';
+      let cursor = 0;
+      for (let i = 0; i < words.length; i += 1) {{
+        const w = words[i];
+        const start = Number(w.index || 0);
+        const token = String(w.text || '');
+        if (start > cursor) {{
+          html += escapeHtml(sentence.slice(cursor, start));
+        }}
+        const cls = i === activeIdx ? 'subtitle-word active' : 'subtitle-word';
+        html += `<span class="${{cls}}">${{escapeHtml(token)}}</span>`;
+        cursor = start + token.length;
+      }}
+      if (cursor < sentence.length) {{
+        html += escapeHtml(sentence.slice(cursor));
+      }}
+      el.innerHTML = html;
+    }}
+
+    function clearSubtitleTicker() {{
+      if (subtitleTicker) {{
+        clearInterval(subtitleTicker);
+        subtitleTicker = null;
+      }}
     }}
 
     function getVoices() {{
       if (!window.speechSynthesis) return [];
       return window.speechSynthesis.getVoices() || [];
+    }}
+
+    function chooseDefaultVoiceName(voices) {{
+      const rows = Array.isArray(voices) ? voices : [];
+      if (!rows.length) return '';
+      // Hard default requested by product requirement.
+      const exact = rows.find((v) => String(v?.name || '').trim() === 'Google UK English Female');
+      if (exact) return String(exact.name);
+
+      // Accept near matches in case browser labels differ slightly.
+      const scored = rows
+        .map((v) => {{
+          const name = String(v?.name || '').toLowerCase();
+          const lang = String(v?.lang || '').toLowerCase();
+          let score = 0;
+          if (name.includes('google')) score += 40;
+          if (name.includes('uk') || name.includes('british')) score += 35;
+          if (name.includes('female') || name.includes('woman')) score += 28;
+          if (lang.startsWith('en-gb')) score += 40;
+          if (lang.startsWith('en')) score += 8;
+          return {{ v, score }};
+        }})
+        .sort((a, b) => b.score - a.score);
+      if (scored.length && scored[0].score >= 45) return String(scored[0].v.name || '');
+      return rows[0]?.name ? String(rows[0].name) : '';
     }}
 
     function scoreVoice(v) {{
@@ -558,8 +1066,13 @@ class AgentOrchestrator:
     function getPreferredVoice() {{
       const voices = getVoices();
       if (!voices.length) return null;
-      if (selectedVoiceName && selectedVoiceName !== 'auto') {{
+      if (selectedVoiceName) {{
         const chosen = voices.find((v) => v.name === selectedVoiceName);
+        if (chosen) return chosen;
+      }}
+      const preferred = chooseDefaultVoiceName(voices);
+      if (preferred) {{
+        const chosen = voices.find((v) => v.name === preferred);
         if (chosen) return chosen;
       }}
       return voices.slice().sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || voices[0];
@@ -569,23 +1082,341 @@ class AgentOrchestrator:
       const sel = document.getElementById('voiceSelect');
       if (!sel) return;
       const voices = getVoices();
-      const previous = selectedVoiceName || 'auto';
+      const previous = selectedVoiceName || chooseDefaultVoiceName(voices);
       sel.innerHTML = '';
-      const auto = document.createElement('option');
-      auto.value = 'auto';
-      auto.textContent = 'Voice: Auto (Best)';
-      sel.appendChild(auto);
       voices.forEach((v) => {{
         const opt = document.createElement('option');
         opt.value = v.name;
         opt.textContent = `${{v.name}} (${{v.lang || 'n/a'}})`;
         sel.appendChild(opt);
       }});
-      const canUsePrev = previous === 'auto' || voices.some((v) => v.name === previous);
-      sel.value = canUsePrev ? previous : 'auto';
+      const canUsePrev = voices.some((v) => v.name === previous);
+      sel.value = canUsePrev ? previous : chooseDefaultVoiceName(voices);
       selectedVoiceName = sel.value;
+      sel.onchange = async () => {{
+        selectedVoiceName = sel.value || chooseDefaultVoiceName(voices);
+        await applyVoiceLanguage();
+        renderScript();
+        render();
+      }};
+    }}
+
+    function detectVoiceLanguage() {{
+      const v = getPreferredVoice();
+      const lang = String((v && v.lang) || 'en-US').trim();
+      return lang || 'en-US';
+    }}
+
+    function setStatusProgress(kind, text, percent, visible) {{
+      const isVideo = kind === 'video';
+      const wrap = document.getElementById(isVideo ? 'videoStatusWrap' : 'translationStatusWrap');
+      const label = document.getElementById(isVideo ? 'videoStatus' : 'translationStatus');
+      const bar = document.getElementById(isVideo ? 'videoProgressBar' : 'translationProgressBar');
+      if (label && typeof text === 'string' && text.length) label.textContent = text;
+      if (bar && Number.isFinite(percent)) {{
+        const p = Math.max(0, Math.min(100, Math.round(percent)));
+        bar.style.width = `${{p}}%`;
+      }}
+      if (wrap && typeof visible === 'boolean') wrap.style.display = visible ? 'block' : 'none';
+    }}
+
+    function startVideoProgressTicker() {{
+      if (videoProgressTicker) clearInterval(videoProgressTicker);
+      let p = 2;
+      setStatusProgress('video', 'Preparing video request... 2%', p, true);
+      const t0 = Date.now();
+      videoProgressTicker = setInterval(() => {{
+        const elapsed = (Date.now() - t0) / 1000;
+        if (p < 92) p += elapsed < 8 ? 5 : elapsed < 20 ? 2 : 1;
+        p = Math.min(92, p);
+        let stage = 'Preparing chapters';
+        if (p >= 28) stage = 'Generating narration audio';
+        if (p >= 58) stage = 'Rendering scenes';
+        if (p >= 82) stage = 'Merging and mixing audio';
+        setStatusProgress('video', `${{stage}}... ${{p}}%`, p, true);
+      }}, 1200);
+    }}
+
+    function stopVideoProgressTicker() {{
+      if (videoProgressTicker) {{
+        clearInterval(videoProgressTicker);
+        videoProgressTicker = null;
+      }}
+    }}
+
+    async function translateNarrations(targetLanguage) {{
+      const lang = String(targetLanguage || '').trim();
+      if (!lang || lang.toLowerCase().startsWith('en')) {{
+        activeLanguage = 'source';
+        setStatusProgress('translation', 'Subtitles are already in selected language.', 100, false);
+        return sourceNarrations;
+      }}
+      if (narrationByLang[lang]) {{
+        activeLanguage = lang;
+        setStatusProgress('translation', 'Using cached subtitle translation.', 100, false);
+        return narrationByLang[lang];
+      }}
+
+      const runId = ++translationRunId;
+      const total = Math.max(1, sourceNarrations.length);
+      const translated = sourceNarrations.slice();
+      const chunkSize = Math.max(1, Math.min(4, Math.ceil(total / 8)));
+      let completed = 0;
+      setStatusProgress('translation', `Translating subtitles... 0% (0/${{total}})`, 0, true);
+      try {{
+        for (let start = 0; start < total; start += chunkSize) {{
+          if (runId !== translationRunId) return sourceNarrations;
+          const chunk = sourceNarrations.slice(start, start + chunkSize);
+          const resp = await fetch('/api/story/translate', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ language: lang, narrations: chunk }}),
+          }});
+          if (!resp.ok) throw new Error('translation_failed');
+          const payload = await resp.json();
+          const rows = Array.isArray(payload?.narrations) ? payload.narrations : [];
+          for (let i = 0; i < chunk.length; i += 1) {{
+            translated[start + i] = String(rows[i] || chunk[i] || sourceNarrations[start + i] || '');
+          }}
+          completed = Math.min(total, start + chunk.length);
+          const pct = Math.round((completed / total) * 100);
+          setStatusProgress('translation', `Translating subtitles... ${{pct}}% (${{completed}}/${{total}})`, pct, true);
+        }}
+        narrationByLang[lang] = translated;
+        if (runId === translationRunId) {{
+          activeLanguage = lang;
+        }}
+        setStatusProgress('translation', `Subtitle translation complete (100%).`, 100, true);
+        return translated;
+      }} catch (_) {{
+        activeLanguage = 'source';
+        setStatusProgress('translation', 'Translation failed. Using source subtitles.', 100, true);
+        return sourceNarrations;
+      }}
+    }}
+
+    async function applyVoiceLanguage() {{
+      if (playing) {{
+        playing = false;
+      }}
+      stopSpeech();
+      stopBgm();
+      const lang = detectVoiceLanguage();
+      isTranslating = true;
+      setPlaybackControlsDisabled(true);
+      translationPromise = translateNarrations(lang)
+        .catch(() => sourceNarrations)
+        .finally(() => {{
+          isTranslating = false;
+          setTimeout(() => setStatusProgress('translation', '', 0, false), 900);
+          setPlaybackControlsDisabled(false);
+        }});
+      await translationPromise;
+    }}
+
+    async function waitForTranslation() {{
+      try {{
+        await translationPromise;
+      }} catch (_) {{
+        // Fallback to source subtitles on translation failure.
+      }}
+    }}
+
+    function setPlaybackControlsDisabled(disabled) {{
+      const ids = ['prevBtn', 'playBtn', 'readBtn', 'pauseBtn', 'nextBtn', 'chapterSelect', 'voiceSelect', 'videoBtn', 'regenBtn'];
+      ids.forEach((id) => {{
+        const el = document.getElementById(id);
+        if (el) el.disabled = !!disabled;
+      }});
+    }}
+
+    async function regenerateCurrentImage() {{
+      if (!slides.length) return;
+      const ok = window.confirm('Replace current chapter image with a newly generated one?');
+      if (!ok) return;
+      const btn = document.getElementById('regenBtn');
+      const status = document.getElementById('regenStatus');
+      if (btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Regenerating...';
+      }}
+      if (status) status.style.display = 'inline';
+      try {{
+        const resp = await fetch(`/api/story/${{encodeURIComponent(taskId)}}/slides/${{idx}}/regenerate-image`, {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+        }});
+        if (!resp.ok) {{
+          let msg = 'Image regeneration failed.';
+          try {{
+            const e = await resp.json();
+            if (e?.error) msg = `${{msg}} ${{e.error}}`;
+          }} catch (_) {{}}
+          throw new Error(msg);
+        }}
+        const data = await resp.json();
+        const nextUrl = String(data?.image_url || '');
+        if (nextUrl) {{
+          slides[idx] = {{ ...(slides[idx] || {{}}), image_url: nextUrl }};
+          render(true);
+        }}
+      }} catch (e) {{
+        window.alert(String(e?.message || e || 'Image regeneration failed.'));
+      }} finally {{
+        if (btn) {{
+          btn.disabled = false;
+          btn.textContent = 'Regenerate Image';
+        }}
+        if (status) status.style.display = 'none';
+      }}
+    }}
+
+    function inferStoryMood() {{
+      const blob = sourceNarrations.join(' ').toLowerCase();
+      if (/(fear|dark|haunted|mystery|shadow|secret|nightmare)/.test(blob)) return 'mystery';
+      if (/(battle|quest|adventure|dragon|hero|journey|epic)/.test(blob)) return 'adventure';
+      if (/(happy|joy|love|friend|magic|dream|peace)/.test(blob)) return 'uplifting';
+      return 'calm';
+    }}
+
+    function playBgmNote(ctx, bus, freq, startAt, dur, gain, type) {{
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(Math.max(40, Number(freq || 220)), startAt);
+      g.gain.setValueAtTime(0.0001, startAt);
+      g.gain.linearRampToValueAtTime(gain, startAt + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, startAt + Math.max(0.08, dur));
+      osc.connect(g);
+      g.connect(bus);
+      osc.start(startAt);
+      osc.stop(startAt + Math.max(0.1, dur + 0.04));
+    }}
+
+    async function startBgm() {{
+      if (bgmTrackAudio || bgmCtx) return;
+      try {{
+        const bgmResp = await fetch(`/api/story/${{encodeURIComponent(taskId)}}/bgm`);
+        if (bgmResp.ok) {{
+          const bgmData = await bgmResp.json();
+          const trackUrl = String(bgmData?.track_url || '');
+          if (trackUrl) {{
+            const a = new Audio(trackUrl);
+            a.loop = true;
+            a.volume = 0.28;
+            bgmTrackAudio = a;
+            await a.play();
+            return;
+          }}
+        }}
+      }} catch (_) {{}}
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      try {{
+        bgmCtx = new Ctx();
+        bgmMaster = bgmCtx.createGain();
+        bgmMaster.gain.value = 0.0001;
+        bgmMaster.connect(bgmCtx.destination);
+        await bgmCtx.resume();
+        const mood = inferStoryMood();
+        const melodyByMood = {{
+          mystery: [220, 246.94, 261.63, 246.94, 220, 196, 220, 246.94],
+          adventure: [261.63, 329.63, 392.0, 329.63, 293.66, 329.63, 349.23, 392.0],
+          uplifting: [293.66, 329.63, 392.0, 440.0, 392.0, 349.23, 329.63, 293.66],
+          calm: [220, 246.94, 261.63, 293.66, 261.63, 246.94, 220, 196],
+        }};
+        const bassByMood = {{
+          mystery: [110, 110, 123.47, 123.47],
+          adventure: [130.81, 146.83, 164.81, 146.83],
+          uplifting: [146.83, 164.81, 174.61, 164.81],
+          calm: [110, 123.47, 130.81, 123.47],
+        }};
+        const melody = melodyByMood[mood] || melodyByMood.calm;
+        const bass = bassByMood[mood] || bassByMood.calm;
+        const beatDur = 0.44;
+        bgmNextTime = bgmCtx.currentTime + 0.06;
+        bgmStep = 0;
+        if (bgmScheduler) clearInterval(bgmScheduler);
+        bgmScheduler = setInterval(() => {{
+          if (!bgmCtx || !bgmMaster) return;
+          while (bgmNextTime < bgmCtx.currentTime + 0.35) {{
+            const i = bgmStep % melody.length;
+            const b = bgmStep % bass.length;
+            const mFreq = melody[i];
+            const bFreq = bass[b];
+            playBgmNote(bgmCtx, bgmMaster, mFreq, bgmNextTime, beatDur * 0.82, 0.11, 'triangle');
+            playBgmNote(bgmCtx, bgmMaster, bFreq, bgmNextTime, beatDur * 0.95, 0.06, 'sine');
+            if ((bgmStep % 2) === 0) {{
+              playBgmNote(bgmCtx, bgmMaster, mFreq * 1.5, bgmNextTime, beatDur * 0.62, 0.035, 'sine');
+            }}
+            bgmNextTime += beatDur;
+            bgmStep += 1;
+          }}
+        }}, 110);
+        const now = bgmCtx.currentTime;
+        bgmMaster.gain.cancelScheduledValues(now);
+        bgmMaster.gain.setValueAtTime(0.0001, now);
+        bgmMaster.gain.linearRampToValueAtTime(0.22, now + 1.2);
+      }} catch (_) {{
+        stopBgm();
+      }}
+    }}
+
+    function stopBgm() {{
+      if (bgmTrackAudio) {{
+        try {{
+          bgmTrackAudio.pause();
+          bgmTrackAudio.src = '';
+        }} catch (_) {{}}
+        bgmTrackAudio = null;
+      }}
+      if (!bgmCtx) return;
+      try {{
+        if (bgmScheduler) {{
+          clearInterval(bgmScheduler);
+          bgmScheduler = null;
+        }}
+        const now = bgmCtx.currentTime;
+        if (bgmMaster) {{
+          bgmMaster.gain.cancelScheduledValues(now);
+          bgmMaster.gain.setValueAtTime(Math.max(0.0001, bgmMaster.gain.value || 0.0001), now);
+          bgmMaster.gain.linearRampToValueAtTime(0.0001, now + 0.6);
+        }}
+        const nodes = bgmNodes.slice();
+        setTimeout(() => {{
+          nodes.forEach((n) => {{
+            try {{ n.osc.stop(); }} catch (_) {{}}
+          }});
+          try {{ bgmCtx.close(); }} catch (_) {{}}
+          bgmCtx = null;
+          bgmMaster = null;
+          bgmNodes = [];
+        }}, 700);
+      }} catch (_) {{
+        bgmCtx = null;
+        bgmMaster = null;
+        bgmNodes = [];
+      }}
+    }}
+
+    function renderChapterSelect() {{
+      const sel = document.getElementById('chapterSelect');
+      if (!sel) return;
+      sel.innerHTML = '';
+      slides.forEach((s, i) => {{
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = `Chapter ${{i + 1}}`;
+        sel.appendChild(opt);
+      }});
+      sel.value = String(idx);
       sel.onchange = () => {{
-        selectedVoiceName = sel.value || 'auto';
+        const nextIdx = Number.parseInt(sel.value, 10);
+        if (Number.isNaN(nextIdx)) return;
+        playing = false;
+        stopSpeech();
+        idx = Math.max(0, Math.min(slides.length - 1, nextIdx));
+        render();
       }};
     }}
 
@@ -596,9 +1427,25 @@ class AgentOrchestrator:
       slides.forEach((s, i) => {{
         const li = document.createElement('li');
         li.id = 'script-item-' + i;
-        li.innerHTML = `<strong>${{s.title || 'Slide ' + (i+1)}}</strong><div class="small">${{s.caption || ''}}</div><div>${{s.narration || ''}}</div>`;
+        const arr = narrationByLang[activeLanguage] || sourceNarrations;
+        li.innerHTML = `<strong>Chapter ${{i + 1}}</strong><div>${{arr[i] || ''}}</div>`;
         root.appendChild(li);
       }});
+    }}
+
+    function copyText(value) {{
+      navigator.clipboard.writeText(String(value || ''));
+    }}
+
+    function renderYoutubeMeta() {{
+      const t = document.getElementById('ytTitle');
+      const d = document.getElementById('ytDescription');
+      const h = document.getElementById('ytHashtags');
+      const k = document.getElementById('ytKeywords');
+      if (t) t.value = String(youtubeMeta.title || '');
+      if (d) d.value = String(youtubeMeta.description || '');
+      if (h) h.value = String(youtubeMeta.hashtags || '');
+      if (k) k.value = String(youtubeMeta.keywords || '');
     }}
 
     function syncActiveScript() {{
@@ -610,21 +1457,81 @@ class AgentOrchestrator:
       if (active) active.scrollIntoView({{ block: 'nearest', behavior: 'smooth' }});
     }}
 
-    function render() {{
+    function render(withTransition = true) {{
       const s = slides[idx] || {{}};
-      const narration = s.narration || '';
-      document.getElementById('slideImage').src = s.image_url || '';
-      document.getElementById('slideTitle').textContent = s.title || '';
-      document.getElementById('slideCaptionTag').textContent = s.caption || '';
-      document.getElementById('slideCaptionOverlay').textContent = narration;
+      const arr = narrationByLang[activeLanguage] || sourceNarrations;
+      const narration = arr[idx] || '';
+      const imgEl = document.getElementById('slideImage');
+      const nextSrc = s.image_url || '';
+      if (imgEl) {{
+        const prevSrc = imgEl.getAttribute('data-src') || '';
+        if (withTransition && prevSrc && prevSrc !== nextSrc) {{
+          imgEl.style.opacity = '0.12';
+          imgEl.style.transition = `opacity ${{Math.round(CHAPTER_TRANSITION_MS / 2)}}ms ease`;
+          setTimeout(() => {{
+            imgEl.src = nextSrc;
+            imgEl.style.opacity = '1';
+            imgEl.setAttribute('data-src', nextSrc);
+          }}, Math.round(CHAPTER_TRANSITION_MS / 2));
+        }} else {{
+          imgEl.src = nextSrc;
+          imgEl.style.opacity = '1';
+          imgEl.setAttribute('data-src', nextSrc);
+        }}
+      }}
+      setSubtitleSentence(narration, 0);
       document.getElementById('slideNarration').textContent = narration;
+      const chapterSel = document.getElementById('chapterSelect');
+      if (chapterSel) chapterSel.value = String(idx);
       syncActiveScript();
     }}
 
-    function speak(text, onEnd) {{
-      if (!window.speechSynthesis) return;
-      const parts = splitSentences(text);
-      const u = new SpeechSynthesisUtterance(text || '');
+    function speak(text, onEnd, shouldContinue) {{
+      if (!window.speechSynthesis) {{
+        if (onEnd) onEnd();
+        return;
+      }}
+      const full = String(text || '').trim();
+      if (!full) {{
+        if (onEnd) onEnd();
+        return;
+      }}
+
+      const runId = ++narrationRunId;
+      const parts = splitSentences(full).filter(Boolean);
+      if (!parts.length) {{
+        if (onEnd) onEnd();
+        return;
+      }}
+
+      const ranges = [];
+      let seek = 0;
+      for (let i = 0; i < parts.length; i += 1) {{
+        const sentence = String(parts[i] || '');
+        const idxInFull = full.indexOf(sentence, seek);
+        const startAt = idxInFull >= 0 ? idxInFull : seek;
+        const endAt = startAt + sentence.length;
+        ranges.push({{ start: startAt, end: endAt }});
+        seek = Math.max(endAt, seek);
+      }}
+
+      const updateByChar = (charIndex) => {{
+        if (runId !== narrationRunId) return;
+        const ch = Math.max(0, Number(charIndex || 0));
+        let sentenceIdx = 0;
+        for (let i = 0; i < ranges.length; i += 1) {{
+          if (ch >= ranges[i].start && ch <= Math.max(ranges[i].end, ranges[i].start)) {{
+            sentenceIdx = i;
+            break;
+          }}
+          if (ch > ranges[i].end) sentenceIdx = i;
+        }}
+        const sentence = parts[sentenceIdx] || '';
+        const localChar = Math.max(0, ch - Number(ranges[sentenceIdx]?.start || 0));
+        setSubtitleSentence(sentence, 0, localChar);
+      }};
+
+      const u = new SpeechSynthesisUtterance(full);
       const v = getPreferredVoice();
       if (v) {{
         u.voice = v;
@@ -635,33 +1542,93 @@ class AgentOrchestrator:
       u.rate = 0.94;
       u.pitch = 1.0;
       u.volume = 1.0;
-      u.onboundary = (ev) => {{
-        const n = String(text || '');
-        const head = n.slice(0, Math.max(0, ev.charIndex || 0));
-        const spokenCount = splitSentences(head).length;
-        const safeIdx = Math.max(1, Math.min(parts.length, spokenCount));
-        document.getElementById('slideCaptionOverlay').textContent = parts[safeIdx - 1] || n;
+
+      let seenWordBoundaryEvents = 0;
+      let lastBoundaryChar = -1;
+
+      u.onstart = () => {{
+        if (runId !== narrationRunId) return;
+        clearSubtitleTicker();
+        setSubtitleSentence(parts[0], 0, 0);
+
+        // Fallback when boundary events are unavailable/sparse.
+        const words = splitWords(full);
+        if (words.length > 1) {{
+          const estWps = Math.max(1.6, 2.6 * (u.rate || 1.0));
+          const intervalMs = Math.max(120, Math.round((1000 / estWps) * 0.8));
+          let fallbackIdx = 0;
+          subtitleTicker = setInterval(() => {{
+            if (runId !== narrationRunId) {{
+              clearSubtitleTicker();
+              return;
+            }}
+            if (fallbackIdx >= words.length) {{
+              clearSubtitleTicker();
+              return;
+            }}
+            const ch = Number(words[fallbackIdx].index || 0);
+            updateByChar(ch);
+            fallbackIdx += 1;
+          }}, intervalMs);
+        }}
       }};
-      u.onend = () => onEnd && onEnd();
+
+      u.onboundary = (ev) => {{
+        if (runId !== narrationRunId) return;
+        if (!ev || typeof ev.charIndex !== 'number') return;
+        const nextChar = Math.max(0, ev.charIndex);
+        if (nextChar < lastBoundaryChar) return;
+        const boundaryKind = String(ev.name || '').toLowerCase();
+        const isWordBoundary = boundaryKind === 'word' || boundaryKind === '';
+        if (isWordBoundary) seenWordBoundaryEvents += 1;
+        lastBoundaryChar = nextChar;
+        if (seenWordBoundaryEvents >= 2) clearSubtitleTicker();
+        updateByChar(nextChar);
+      }};
+
+      u.onend = () => {{
+        if (runId !== narrationRunId) return;
+        clearSubtitleTicker();
+        if (typeof shouldContinue === 'function' && !shouldContinue()) return;
+        if (onEnd) onEnd();
+      }};
+
+      u.onerror = () => {{
+        if (runId !== narrationRunId) return;
+        clearSubtitleTicker();
+        if (typeof shouldContinue === 'function' && !shouldContinue()) return;
+        if (onEnd) onEnd();
+      }};
+
       window.speechSynthesis.speak(u);
     }}
 
     function stopSpeech() {{
+      narrationRunId += 1;
+      clearSubtitleTicker();
+      if (activeAudioEl) {{
+        try {{
+          activeAudioEl.pause();
+          activeAudioEl.src = '';
+        }} catch (_) {{}}
+        activeAudioEl = null;
+      }}
       if (window.speechSynthesis) window.speechSynthesis.cancel();
     }}
 
-    function readCurrent() {{
+    async function readCurrent() {{
+      await waitForTranslation();
+      if (isTranslating) return;
       playing = false;
       stopSpeech();
+      stopBgm();
       const s = slides[idx] || {{}};
-      document.getElementById('slideCaptionOverlay').textContent = s.narration || '';
-      speak(getNarration(s));
+      speak(getNarration(s), null, () => !playing);
     }}
 
     function playFromCurrent() {{
       if (!playing) return;
       const s = slides[idx] || {{}};
-      document.getElementById('slideCaptionOverlay').textContent = s.narration || '';
       speak(getNarration(s), () => {{
         if (!playing) return;
         if (idx < slides.length - 1) {{
@@ -670,15 +1637,223 @@ class AgentOrchestrator:
           playFromCurrent();
         }} else {{
           playing = false;
+          stopBgm();
+          if (storyPlaybackEndResolver) {{
+            const resolveEnd = storyPlaybackEndResolver;
+            storyPlaybackEndResolver = null;
+            resolveEnd();
+          }}
         }}
-      }});
+      }}, () => playing);
     }}
 
-    function playStory() {{
+    async function generateStoryVideo() {{
+      if (!slides.length) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia || typeof MediaRecorder === 'undefined') {{
+        window.alert('This browser does not support tab recording. Please use latest Chrome/Edge.');
+        return;
+      }}
+      const btn = document.getElementById('videoBtn');
+      const dl = document.getElementById('videoDownload');
+      if (btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Recording...';
+      }}
+      if (dl) dl.style.display = 'none';
+
+      let stream = null;
+      let composeStream = null;
+      let recorder = null;
+      let progressTimer = null;
+      let drawTimer = null;
+      const chunks = [];
+      try {{
+        const lang = detectVoiceLanguage();
+        setStatusProgress('video', 'Preparing translated subtitles... 5%', 5, true);
+        await translateNarrations(lang);
+        setStatusProgress('video', 'Select This Tab and enable tab audio before recording.', 10, true);
+
+        stream = await navigator.mediaDevices.getDisplayMedia({{
+          video: {{ frameRate: 30 }},
+          audio: true,
+        }});
+        if (!stream) throw new Error('record_stream_unavailable');
+        const audioTracks = stream.getAudioTracks();
+        if (!audioTracks.length) {{
+          throw new Error('No tab audio detected. Please share this tab and enable tab audio.');
+        }}
+
+        const outW = 1920;
+        const outH = 1080;
+        const canvas = document.createElement('canvas');
+        canvas.width = outW;
+        canvas.height = outH;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('canvas_context_unavailable');
+
+        const wrapText = (text, maxWidth) => {{
+          const words = String(text || '').replace(/\\s+/g, ' ').trim().split(' ');
+          const lines = [];
+          let cur = '';
+          for (const w of words) {{
+            const probe = cur ? `${{cur}} ${{w}}` : w;
+            if (ctx.measureText(probe).width <= maxWidth) {{
+              cur = probe;
+            }} else {{
+              if (cur) lines.push(cur);
+              cur = w;
+            }}
+          }}
+          if (cur) lines.push(cur);
+          return lines.slice(0, 3);
+        }};
+
+        const drawFrame = () => {{
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(0, 0, outW, outH);
+          const imgEl = document.getElementById('slideImage');
+          if (imgEl && imgEl.naturalWidth > 0 && imgEl.naturalHeight > 0) {{
+            const iw = imgEl.naturalWidth;
+            const ih = imgEl.naturalHeight;
+            const scale = Math.max(outW / iw, outH / ih);
+            const dw = iw * scale;
+            const dh = ih * scale;
+            const dx = (outW - dw) / 2;
+            const dy = (outH - dh) / 2;
+            try {{ ctx.drawImage(imgEl, dx, dy, dw, dh); }} catch (_) {{}}
+          }}
+
+          const subtitleEl = document.getElementById('slideCaptionOverlay');
+          const subtitle = String((subtitleEl && (subtitleEl.innerText || subtitleEl.textContent)) || '').trim();
+          const boxH = 230;
+          ctx.fillStyle = 'rgba(0,0,0,0.58)';
+          ctx.fillRect(0, outH - boxH, outW, boxH);
+          ctx.font = 'bold 56px Arial, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = '#ffffff';
+          ctx.shadowColor = 'rgba(0,0,0,0.55)';
+          ctx.shadowBlur = 6;
+          const lines = wrapText(subtitle, outW - 120);
+          const lineH = 66;
+          const startY = outH - boxH / 2 - ((lines.length - 1) * lineH) / 2;
+          lines.forEach((line, i) => {{
+            ctx.fillText(line, outW / 2, startY + i * lineH);
+          }});
+          ctx.shadowBlur = 0;
+        }};
+
+        drawFrame();
+        drawTimer = setInterval(drawFrame, Math.round(1000 / 30));
+        composeStream = canvas.captureStream(30);
+        const recTracks = [
+          ...(composeStream.getVideoTracks() || []),
+          ...audioTracks,
+        ];
+        const recStream = new MediaStream(recTracks);
+
+        const mimeCandidates = [
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm',
+        ];
+        const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+        recorder = mimeType ? new MediaRecorder(recStream, {{ mimeType }}) : new MediaRecorder(recStream);
+        recorder.ondataavailable = (ev) => {{
+          if (ev && ev.data && ev.data.size > 0) chunks.push(ev.data);
+        }};
+
+        const stopped = new Promise((resolve) => {{
+          recorder.onstop = () => resolve();
+        }});
+
+        const cancelAll = () => {{
+          playing = false;
+          stopSpeech();
+          stopBgm();
+          if (storyPlaybackEndResolver) {{
+            const resolveEnd = storyPlaybackEndResolver;
+            storyPlaybackEndResolver = null;
+            resolveEnd();
+          }}
+        }};
+        stream.getTracks().forEach((t) => {{
+          t.onended = cancelAll;
+        }});
+
+        setStatusProgress('video', 'Recording image+subtitle video... 15%', 15, true);
+        recorder.start(1000);
+        const storyEnded = new Promise((resolve) => {{
+          storyPlaybackEndResolver = resolve;
+        }});
+
+        await playStory();
+        progressTimer = setInterval(() => {{
+          const chapterFrac = slides.length > 0 ? (idx + 1) / slides.length : 0.0;
+          const p = Math.max(18, Math.min(96, Math.round(18 + (chapterFrac * 76))));
+          setStatusProgress('video', `Recording story... ${{p}}%`, p, true);
+        }}, 700);
+        await storyEnded;
+        if (progressTimer) {{
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }}
+        setStatusProgress('video', 'Finalizing recording... 98%', 98, true);
+
+        if (recorder && recorder.state !== 'inactive') recorder.stop();
+        if (drawTimer) {{
+          clearInterval(drawTimer);
+          drawTimer = null;
+        }}
+        if (composeStream) composeStream.getTracks().forEach((t) => t.stop());
+        if (stream) stream.getTracks().forEach((t) => t.stop());
+        await stopped;
+        if (!chunks.length) throw new Error('recording_empty');
+
+        const blob = new Blob(chunks, {{ type: recorder.mimeType || 'video/webm' }});
+        const url = URL.createObjectURL(blob);
+        const ext = (recorder.mimeType || '').includes('webm') ? 'webm' : 'webm';
+        setStatusProgress('video', 'Video recording complete (100%).', 100, true);
+        if (dl) {{
+          dl.href = url;
+          dl.download = `story_${{taskId}}_ui_voice.${{ext}}`;
+          dl.style.display = 'inline';
+          dl.textContent = 'Download Recorded Story Video (UI voice)';
+        }}
+      }} catch (e) {{
+        setStatusProgress('video', 'Video generation failed.', 100, true);
+        window.alert(String((e && e.message) || e || 'Video generation failed.'));
+      }} finally {{
+        if (progressTimer) clearInterval(progressTimer);
+        if (drawTimer) clearInterval(drawTimer);
+        progressTimer = null;
+        drawTimer = null;
+        storyPlaybackEndResolver = null;
+        if (recorder && recorder.state !== 'inactive') {{
+          try {{ recorder.stop(); }} catch (_) {{}}
+        }}
+        if (composeStream) {{
+          try {{ composeStream.getTracks().forEach((t) => t.stop()); }} catch (_) {{}}
+        }}
+        if (stream) {{
+          try {{ stream.getTracks().forEach((t) => t.stop()); }} catch (_) {{}}
+        }}
+        if (btn) {{
+          btn.disabled = false;
+          btn.textContent = 'Generate Video';
+        }}
+        setTimeout(() => setStatusProgress('video', '', 0, false), 1600);
+      }}
+    }}
+
+    async function playStory() {{
+      await waitForTranslation();
+      if (isTranslating) return;
       if (!slides.length) return;
       stopSpeech();
       idx = 0;
       playing = true;
+      await startBgm();
       render();
       playFromCurrent();
     }}
@@ -686,17 +1861,23 @@ class AgentOrchestrator:
     function pauseStory() {{
       playing = false;
       stopSpeech();
+      stopBgm();
     }}
 
-    function prev() {{ playing = false; stopSpeech(); idx = (idx - 1 + slides.length) % slides.length; render(); }}
-    function next() {{ playing = false; stopSpeech(); idx = (idx + 1) % slides.length; render(); }}
+    function prev() {{ playing = false; stopSpeech(); stopBgm(); idx = (idx - 1 + slides.length) % slides.length; render(); }}
+    function next() {{ playing = false; stopSpeech(); stopBgm(); idx = (idx + 1) % slides.length; render(); }}
 
     renderScript();
+    renderYoutubeMeta();
+    renderChapterSelect();
     renderVoiceSelect();
     if (window.speechSynthesis) {{
       window.speechSynthesis.onvoiceschanged = () => renderVoiceSelect();
     }}
-    render();
+    applyVoiceLanguage().finally(() => {{
+      renderScript();
+      render(false);
+    }});
   </script>
 </body>
 </html>"""
@@ -704,7 +1885,7 @@ class AgentOrchestrator:
     def _story_placeholder_image(self, caption: str) -> str:
         text = (caption or "Illustration").strip()[:80]
         svg = (
-            "<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='720'>"
+            "<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'>"
             "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
             "<stop offset='0%' stop-color='#1e3a8a'/>"
             "<stop offset='100%' stop-color='#0f172a'/>"
@@ -864,6 +2045,16 @@ Output ONLY the plan in the following format:
                     self._log(
                         session_id=sess.id,
                         task_id=task.id,
+                        event_type="llm_prompt",
+                        data={
+                            "provider": "reasoning",
+                            "model": (self.llm.get_model_for_task("reasoning").name if self.llm else ""),
+                            "output": self._trim_text(f"LLM prompt (image refine): {task.description}", 2500),
+                        },
+                    )
+                    self._log(
+                        session_id=sess.id,
+                        task_id=task.id,
                         event_type="plan_step_update",
                         data={"index": 0, "status": "completed", "step": image_plan_steps[0]},
                     )
@@ -871,11 +2062,16 @@ Output ONLY the plan in the following format:
                         session_id=sess.id,
                         task_id=task.id,
                         event_type="prompt_refined",
-                        data={"original": task.description, "refined": refined_prompt, "source": refine_source},
+                        data={
+                            "original": task.description,
+                            "refined": refined_prompt,
+                            "source": refine_source,
+                            "output": self._trim_text(f"Stability prompt: {refined_prompt}", 2500),
+                        },
                     )
                     result = self.toolbus.image_generate(
                         refined_prompt,
-                        aspect_ratio=stability.get("default_aspect_ratio", "1:1"),
+                        aspect_ratio="16:9",
                         style_preset=stability.get("default_style_preset", "") or None,
                         output_format=stability.get("default_output_format", "png"),
                         api_key=api_key,
@@ -913,6 +2109,12 @@ Output ONLY the plan in the following format:
                             progress=1.0,
                             status_detail="image_generated",
                             last_output=output,
+                            context_snapshot={
+                                "model_used": {
+                                    "provider": "stability",
+                                    "name": "stable-image-core",
+                                }
+                            },
                         )
                         self._log(session_id=sess.id, task_id=task.id, event_type="task_completed", data={})
                     else:
@@ -923,6 +2125,12 @@ Output ONLY the plan in the following format:
                             status_detail="image_generation_failed",
                             failure_reason=output,
                             last_output=output,
+                            context_snapshot={
+                                "model_used": {
+                                    "provider": "stability",
+                                    "name": "stable-image-core",
+                                }
+                            },
                         )
                         self._log(
                             session_id=sess.id,
@@ -948,15 +2156,37 @@ Output ONLY the plan in the following format:
                         data={"steps": story_steps},
                     )
                     model_info = self.llm.get_model_for_task("general")
-                    story_title, slides = self._generate_story_slides(task, model_info)
+                    self._update_task(task, context_snapshot={"model_info": model_info})
+                    opts = self._story_options(task)
+                    self._log(
+                        session_id=sess.id,
+                        task_id=task.id,
+                        event_type="llm_prompt",
+                        data={
+                            "provider": model_info.provider,
+                            "model": model_info.name,
+                            "output": self._trim_text(
+                                f"LLM prompt (story generation, target {opts.get('target_minutes', 5)} min): {task.description}",
+                                2500,
+                            ),
+                        },
+                    )
+                    story_title, slides = self._generate_story_slides(task, model_info, opts)
+                    story_character_bible = self._derive_story_character_bible(task.description, slides, model_info)
                     self._log(
                         session_id=sess.id,
                         task_id=task.id,
                         event_type="plan_step_update",
                         data={"index": 0, "status": "completed", "step": story_steps[0]},
                     )
+                    if story_character_bible:
+                        self._log(
+                            session_id=sess.id,
+                            task_id=task.id,
+                            event_type="story_character_bible",
+                            data={"character_bible": story_character_bible},
+                        )
 
-                    opts = self._story_options(task)
                     illustration_summary = {
                         "requested": 0,
                         "generated": 0,
@@ -977,6 +2207,8 @@ Output ONLY the plan in the following format:
                             max_imgs = min(len(slides), int(opts.get("illustration_count", 10)))
                         else:
                             max_imgs = self._auto_story_illustration_count(slides)
+                        # Guarantee at least one illustration attempt per chapter/slide.
+                        max_imgs = max(len(slides), max_imgs)
                         illustration_summary["requested"] = max_imgs
                         if max_imgs > 0 and not api_key:
                             err = "Stability API key is not configured; using fallback placeholder illustrations."
@@ -992,7 +2224,12 @@ Output ONLY the plan in the following format:
                             if not api_key:
                                 break
                             raw_prompt = slides[i].get("image_prompt") or slides[i].get("narration") or task.description
-                            style_augmented = self._build_story_illustration_prompt(raw_prompt, style_key)
+                            style_augmented = self._build_story_illustration_prompt(
+                                raw_prompt,
+                                style_key,
+                                character_bible=story_character_bible,
+                                chapter_idx=i + 1,
+                            )
                             refined_prompt, _ = self._refine_image_prompt(style_augmented)
                             self._log(
                                 session_id=sess.id,
@@ -1003,12 +2240,13 @@ Output ONLY the plan in the following format:
                                     "slide_index": i,
                                     "prompt": refined_prompt,
                                     "style": style_key,
+                                    "output": self._trim_text(f"Stability prompt (slide {i + 1}): {refined_prompt}", 2500),
                                 },
                             )
                             img_res = self.toolbus.image_generate(
                                 refined_prompt,
                                 negative_prompt=self._story_negative_prompt(),
-                                aspect_ratio=stability.get("default_aspect_ratio", "1:1"),
+                                aspect_ratio="16:9",
                                 style_preset=style_preset or stability.get("default_style_preset", "") or None,
                                 output_format=stability.get("default_output_format", "png"),
                                 api_key=api_key,
@@ -1041,11 +2279,15 @@ Output ONLY the plan in the following format:
                                 or slides[i].get("narration")
                                 or task.description
                             )
-                            fallback_prompt = f"{fallback_prompt}, {style_text}, coherent composition, clean anatomy, no text or watermark"
+                            fallback_prompt = (
+                                f"{fallback_prompt}, {style_text}, "
+                                + (f"character bible: {story_character_bible}, " if story_character_bible else "")
+                                + "coherent composition, clean anatomy, no text or watermark"
+                            )
                             retry_res = self.toolbus.image_generate(
                                 fallback_prompt,
                                 negative_prompt=self._story_negative_prompt(),
-                                aspect_ratio=stability.get("default_aspect_ratio", "1:1"),
+                                aspect_ratio="16:9",
                                 style_preset=style_preset,
                                 output_format=stability.get("default_output_format", "png"),
                                 api_key=api_key,
@@ -1116,7 +2358,7 @@ Output ONLY the plan in the following format:
                     story_dir = os.path.join(workspace, "story")
                     os.makedirs(story_dir, exist_ok=True)
                     html_path = os.path.join(story_dir, f"{task.id}.html")
-                    html = self._build_story_html(story_title, slides)
+                    html = self._build_story_html(task.id, story_title, slides)
                     with open(html_path, "w", encoding="utf-8") as f:
                         f.write(html)
                     preview_url = f"/api/story/{task.id}"
@@ -1139,6 +2381,7 @@ Output ONLY the plan in the following format:
                         status_detail="story_generated",
                         last_output=(
                             f"Story generated successfully.\nPreview URL: {preview_url}\n"
+                            f"Target story length: {opts.get('target_minutes', 5)} minutes\n"
                             f"Illustrations: {'enabled' if opts.get('generate_illustrations') else 'disabled'}\n"
                             f"Illustration style: {opts.get('illustration_style', 'ghibli')}\n"
                             f"Illustration images generated: {illustration_summary['generated']}/{illustration_summary['requested']}"
@@ -1146,7 +2389,9 @@ Output ONLY the plan in the following format:
                         context_snapshot={
                             "story_artifact_path": html_path,
                             "story_title": story_title,
+                            "story_slides": slides,
                             "story_options": opts,
+                            "story_character_bible": story_character_bible,
                             "illustration_summary": illustration_summary,
                         },
                     )
@@ -1168,6 +2413,16 @@ Output ONLY the plan in the following format:
                 ws_structure = self._get_workspace_structure(workspace)
                 
                 plan = self._generate_plan(task.description, model_info, ws_structure)
+                self._log(
+                    session_id=sess.id,
+                    task_id=task.id,
+                    event_type="llm_prompt",
+                    data={
+                        "provider": model_info.provider,
+                        "model": model_info.name,
+                        "output": self._trim_text(f"LLM prompt (planning): {task.description}", 2500),
+                    },
+                )
                 self._log(session_id=sess.id, task_id=task.id, event_type="plan_generated", data={"plan": plan})
                 plan_steps = self._extract_plan_steps(plan)
                 if plan_steps:
@@ -1275,6 +2530,19 @@ Do NOT output DONE if the last step failed.
                 # 2. Call LLM
                 try:
                     self._log(session_id=sess.id, task_id=task.id, event_type="thinking", data={"step": i+1})
+                    latest_user = self._latest_user_message(messages)
+                    if latest_user:
+                        self._log(
+                            session_id=sess.id,
+                            task_id=task.id,
+                            event_type="llm_prompt",
+                            data={
+                                "provider": model_info.provider,
+                                "model": model_info.name,
+                                "step": i + 1,
+                                "output": self._trim_text(f"LLM prompt (step {i + 1}): {latest_user}", 2500),
+                            },
+                        )
                     response_text = self.llm.call_model(model_info, messages, tools)
 
                     # Hard-stop on provider/API errors so the task doesn't falsely progress.
@@ -1445,7 +2713,7 @@ Do NOT output DONE if the last step failed.
                             result = self.toolbus.image_generate(
                                 refined_prompt,
                                 negative_prompt=tool_args.get("negative_prompt", ""),
-                                aspect_ratio=tool_args.get("aspect_ratio", stability.get("default_aspect_ratio", "1:1")),
+                                aspect_ratio=tool_args.get("aspect_ratio", stability.get("default_aspect_ratio", "16:9")),
                                 seed=int(tool_args.get("seed", 0) or 0),
                                 style_preset=tool_args.get("style_preset", stability.get("default_style_preset", "")) or None,
                                 output_format=tool_args.get("output_format", stability.get("default_output_format", "png")),
@@ -1457,7 +2725,12 @@ Do NOT output DONE if the last step failed.
                                 session_id=sess.id,
                                 task_id=task.id,
                                 event_type="prompt_refined",
-                                data={"original": raw_prompt, "refined": refined_prompt, "source": refine_source},
+                                data={
+                                    "original": raw_prompt,
+                                    "refined": refined_prompt,
+                                    "source": refine_source,
+                                    "output": self._trim_text(f"Stability prompt: {refined_prompt}", 2500),
+                                },
                             )
                         else:
                             result = {"ok": False, "output": f"Unknown tool: {tool_name}", "meta": {}}

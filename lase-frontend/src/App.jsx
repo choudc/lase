@@ -63,6 +63,18 @@ function App() {
     if (/(research|analyze|analysis|compare|investigate|report|study)/.test(t)) return 'research'
     return null
   }
+  const inferStoryDurationFromPrompt = (text) => {
+    const t = String(text || '').toLowerCase().trim()
+    if (!t) return null
+    if (t.includes('half hour') || t.includes('half-hour')) return 30
+    const hr = t.match(/\b(\d{1,2})\s*(hours|hour|hrs|hr)\b/)
+    if (hr?.[1]) return Math.max(3, Math.min(30, Number(hr[1]) * 60))
+    const min = t.match(/\b(\d{1,3})\s*(minutes|minute|mins|min)\b/)
+    if (min?.[1]) return Math.max(3, Math.min(30, Number(min[1])))
+    const compact = t.match(/\b(\d{1,3})m\b/)
+    if (compact?.[1]) return Math.max(3, Math.min(30, Number(compact[1])))
+    return null
+  }
   const CATEGORY_OPTIONS = [
     { id: 'image', label: 'Image' },
     { id: 'website', label: 'Website' },
@@ -78,6 +90,7 @@ function App() {
   const [selectedCategory, setSelectedCategory] = useState('website')
   const [storyGenerateIllustrations, setStoryGenerateIllustrations] = useState(true)
   const [storyIllustrationStyle, setStoryIllustrationStyle] = useState('ghibli')
+  const [storyTargetMinutes, setStoryTargetMinutes] = useState(5)
   const [isLoading, setIsLoading] = useState(false)
   const [models, setModels] = useState([])
   const [tools, setTools] = useState([])
@@ -111,6 +124,10 @@ function App() {
     }
     return out
   }, [logs])
+  const detectedStoryMinutes = useMemo(
+    () => inferStoryDurationFromPrompt(newTaskDescription),
+    [newTaskDescription]
+  )
 
   useEffect(() => {
     const controller = new AbortController()
@@ -233,6 +250,7 @@ function App() {
           generate_illustrations: storyGenerateIllustrations,
           illustration_count_mode: 'auto',
           illustration_style: storyIllustrationStyle || 'ghibli',
+          duration_minutes: storyTargetMinutes,
         },
         auto_start: true,
       })
@@ -465,6 +483,16 @@ function App() {
   const resolveTaskPreviewUrl = (task) =>
     taskToPreviewUrl(task) || taskPreviewUrlsById[task?.id] || null
 
+  useEffect(() => {
+    const latestCompletedStory = (tasks || []).find(
+      (t) => String(t?.category || '').toLowerCase() === 'story' && String(t?.status || '') === 'completed'
+    )
+    if (!latestCompletedStory) return
+    const nextUrl = resolveTaskPreviewUrl(latestCompletedStory)
+    if (!nextUrl) return
+    setPreviewUrl((prev) => (prev === nextUrl ? prev : nextUrl))
+  }, [tasks, taskPreviewUrlsById])
+
   const getTaskOutputType = (task) => {
     const category = String(task?.category || '').toLowerCase()
     if (category === 'image') return 'image'
@@ -526,6 +554,19 @@ function App() {
       return `${short} (${activity})`
     }
     return `${intent}: ${activity}`
+  }
+
+  const getTaskModelLabel = (task) => {
+    const snap = task?.context_snapshot || {}
+    const m = snap?.model_info || snap?.model_used || null
+    if (m && typeof m === 'object') {
+      const provider = String(m.provider || '').trim()
+      const name = String(m.name || '').trim()
+      if (provider && name) return `${provider}:${name}`
+      if (name) return name
+      if (provider) return provider
+    }
+    return 'pending'
   }
 
   useEffect(() => {
@@ -736,6 +777,25 @@ function App() {
                           <option value="photorealistic">Photorealistic</option>
                         </select>
                       </label>
+                      <label className="flex items-center gap-2">
+                        Story length:
+                        <select
+                          value={storyTargetMinutes}
+                          onChange={(e) => setStoryTargetMinutes(Number(e.target.value))}
+                          className="rounded border bg-white px-2 py-1"
+                        >
+                          <option value={3}>3 min</option>
+                          <option value={5}>5 min</option>
+                          <option value={10}>10 min</option>
+                          <option value={15}>15 min</option>
+                          <option value={30}>30 min</option>
+                        </select>
+                      </label>
+                      <span className="text-slate-700">
+                        {detectedStoryMinutes
+                          ? `Detected from prompt: ${detectedStoryMinutes} min (overrides selector)`
+                          : 'Used when prompt does not specify duration'}
+                      </span>
                     </div>
                   )}
                   <div className="flex gap-2">
@@ -777,6 +837,7 @@ function App() {
                                   {task.category && (
                                     <Badge variant="outline" className="text-[10px] uppercase">{String(task.category).replaceAll('_', ' ')}</Badge>
                                   )}
+                                  <Badge variant="outline" className="text-[10px]">model: {getTaskModelLabel(task)}</Badge>
                                 </div>
                                 <Badge variant="secondary" className="text-xs">{task.status}</Badge>
                               </div>
